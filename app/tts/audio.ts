@@ -120,6 +120,12 @@ export interface AudioPlayer {
   /** Wait for all queued audio to finish, then close the audio context. */
   close(): Promise<void>;
 
+  /** Immediately stop all playing audio and clear the queue. */
+  abort(): void;
+
+  /** Check if playback has been aborted. */
+  readonly aborted: boolean;
+
   /** Get all played audio as a WAV blob. */
   toWav(): Blob;
 
@@ -190,9 +196,13 @@ export function createStreamingPlayer(): AudioPlayer {
   let nextStartTime = audioCtx.currentTime;
   let lastEndedPromise: Promise<void> = Promise.resolve();
   const chunks: Float32Array[] = [];
+  const activeSources: AudioBufferSourceNode[] = [];
+  let isAborted = false;
 
   return {
     playChunk(samples: Float32Array) {
+      if (isAborted) return;
+
       chunks.push(samples.slice());
 
       const buffer = audioCtx.createBuffer(1, samples.length, SAMPLE_RATE);
@@ -202,6 +212,13 @@ export function createStreamingPlayer(): AudioPlayer {
       source.buffer = buffer;
       source.connect(audioCtx.destination);
 
+      // Track active sources for abort
+      activeSources.push(source);
+      source.onended = () => {
+        const idx = activeSources.indexOf(source);
+        if (idx !== -1) activeSources.splice(idx, 1);
+      };
+
       // Schedule this chunk right after the previous one
       const startTime = Math.max(nextStartTime, audioCtx.currentTime);
       source.start(startTime);
@@ -209,7 +226,11 @@ export function createStreamingPlayer(): AudioPlayer {
 
       // Track when this source finishes playing
       lastEndedPromise = new Promise((resolve) => {
-        source.onended = () => resolve();
+        source.onended = () => {
+          const idx = activeSources.indexOf(source);
+          if (idx !== -1) activeSources.splice(idx, 1);
+          resolve();
+        };
       });
     },
 
@@ -220,8 +241,28 @@ export function createStreamingPlayer(): AudioPlayer {
     },
 
     async close() {
-      await lastEndedPromise;
+      if (!isAborted) {
+        await lastEndedPromise;
+      }
       await audioCtx.close();
+    },
+
+    abort() {
+      isAborted = true;
+      // Stop all active audio sources immediately
+      for (const source of activeSources) {
+        try {
+          source.stop();
+        } catch {
+          // Source may have already stopped
+        }
+      }
+      activeSources.length = 0;
+      nextStartTime = audioCtx.currentTime;
+    },
+
+    get aborted() {
+      return isAborted;
     },
 
     toWav() {

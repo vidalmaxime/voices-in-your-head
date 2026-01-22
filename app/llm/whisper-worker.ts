@@ -103,6 +103,33 @@ async function generate({ audio, language }: { audio: Float32Array; language: st
   processing = false;
 }
 
+async function generatePartial({ audio, language }: { audio: Float32Array; language: string }) {
+  // Quick transcription for thought completion - no streaming needed
+  if (processing) return;
+  processing = true;
+
+  const [tokenizer, processor, model] =
+    await AutomaticSpeechRecognitionPipeline.getInstance();
+
+  const inputs = await processor(audio);
+
+  const outputs = await model.generate({
+    ...inputs,
+    max_new_tokens: MAX_NEW_TOKENS,
+    language,
+  });
+
+  const decoded = tokenizer.batch_decode(outputs, {
+    skip_special_tokens: true,
+  }) as string[];
+
+  self.postMessage({
+    status: "partialComplete",
+    output: decoded[0],
+  });
+  processing = false;
+}
+
 async function load() {
   self.postMessage({
     status: "loading",
@@ -127,7 +154,7 @@ async function load() {
 }
 
 export interface WhisperWorkerMessage {
-  type: "load" | "generate";
+  type: "load" | "generate" | "generatePartial";
   data?: {
     audio: Float32Array;
     language: string;
@@ -145,6 +172,12 @@ self.addEventListener("message", async (e: MessageEvent<WhisperWorkerMessage>) =
     case "generate":
       if (data) {
         generate(data);
+      }
+      break;
+
+    case "generatePartial":
+      if (data) {
+        generatePartial(data);
       }
       break;
   }

@@ -14,6 +14,7 @@ export interface PlayTTSOptions {
   lsdDecodeSteps: number;
   temperature: number;
   noiseClamp: number | null;
+  signal?: AbortSignal;
 }
 
 export async function playTTS(
@@ -27,6 +28,7 @@ export async function playTTS(
     lsdDecodeSteps = 1,
     temperature = 0.7,
     noiseClamp = null,
+    signal,
   }: Partial<PlayTTSOptions> = {},
 ): Promise<void> {
   let sequence = model.flowLM.bosEmb.ref.reshape([1, -1]); // [1, 32]
@@ -44,6 +46,12 @@ export async function playTTS(
     let lastTimestamp = performance.now();
 
     for (let step = 0; step < 1000; step++) {
+      // Check for abort signal
+      if (signal?.aborted || player.aborted) {
+        console.log("TTS aborted at step", step);
+        break;
+      }
+
       let stepKey: np.Array;
       [key, stepKey] = random.split(key);
       const {

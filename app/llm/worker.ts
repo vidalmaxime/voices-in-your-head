@@ -6,10 +6,11 @@ import {
 } from "@huggingface/transformers";
 
 export interface WorkerMessage {
-  type: "check" | "load" | "generate" | "interrupt" | "reset";
+  type: "check" | "load" | "generate" | "generateCompletion" | "interrupt" | "reset";
   data?: {
     messages: Array<{ role: string; content: string }>;
     reasonEnabled?: boolean;
+    partialText?: string;
   };
 }
 
@@ -47,7 +48,7 @@ type AnyModel = any;
 type AnyTokenizer = any;
 
 class TextGenerationPipeline {
-  static model_id = "onnx-community/Qwen3-0.6B-ONNX";
+  static model_id = "onnx-community/Qwen3-0.6B-ONNX"; //"onnx-community/granite-4.0-350m-ONNX";
   static tokenizer: Promise<AnyTokenizer> | null = null;
   static model: Promise<AnyModel> | null = null;
 
@@ -151,6 +152,80 @@ async function generate({ messages, reasonEnabled }: { messages: Array<{ role: s
   });
 }
 
+async function generateCompletion({ partialText }: { partialText: string }) {
+  const [tokenizer, model] = await TextGenerationPipeline.getInstance();
+
+  const systemPrompt = `Finish the sentence. Rules:
+- Output ONLY the ending words, never repeat the input
+- Be specific to context, not generic
+- 3-8 words maximum
+- No punctuation at start`;
+
+  const messages = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: partialText },
+  ];
+
+  const inputs = tokenizer.apply_chat_template(messages, {
+    add_generation_prompt: true,
+    return_dict: true,
+    enable_thinking: false,
+  } as Record<string, unknown>);
+
+  let startTime: number | null = null;
+  let numTokens = 0;
+  let tps = 0;
+
+  const token_callback_function = () => {
+    startTime ??= performance.now();
+    if (numTokens++ > 0) {
+      tps = (numTokens / (performance.now() - startTime)) * 1000;
+    }
+  };
+
+  const callback_function = (output: string) => {
+    self.postMessage({
+      status: "update",
+      output,
+      tps,
+      numTokens,
+      state: "answering",
+    });
+  };
+
+  const streamer = new TextStreamer(tokenizer, {
+    skip_prompt: true,
+    skip_special_tokens: true,
+    callback_function,
+    token_callback_function,
+  });
+
+  self.postMessage({ status: "start" });
+
+  const generateOptions = {
+    ...(inputs as Record<string, unknown>),
+    do_sample: true,
+    top_k: 10,
+    temperature: 0.5,
+    max_new_tokens: 50,
+    streamer,
+    stopping_criteria,
+    return_dict_in_generate: true,
+  };
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const result = await model.generate(generateOptions) as any;
+
+  const decoded = tokenizer.batch_decode(result.sequences, {
+    skip_special_tokens: true,
+  }) as string[];
+
+  self.postMessage({
+    status: "complete",
+    output: decoded[0],
+  });
+}
+
 async function load() {
   self.postMessage({
     status: "loading",
@@ -187,6 +262,13 @@ self.addEventListener("message", async (e: MessageEvent<WorkerMessage>) => {
       stopping_criteria.reset();
       if (data) {
         generate(data);
+      }
+      break;
+
+    case "generateCompletion":
+      stopping_criteria.reset();
+      if (data?.partialText) {
+        generateCompletion({ partialText: data.partialText });
       }
       break;
 

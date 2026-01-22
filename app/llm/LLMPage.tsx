@@ -1,9 +1,9 @@
 "use client";
 
-import { useEffect, useState, useRef, useCallback, FormEvent } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
 import { defaultDevice, init, numpy as np, tree } from "@jax-js/jax";
 import { cachedFetch, safetensors, tokenizers } from "@jax-js/loaders";
-import { MessageSquare, Send, Square, Volume2, VolumeX, Loader2, Upload, Mic, MicOff } from "lucide-react";
+import { Loader2, Mic, MicOff, Volume2, VolumeX } from "lucide-react";
 import { MicVAD } from "@ricky0123/vad-web";
 
 import DownloadManager, { DownloadManagerHandle } from "../tts/DownloadManager";
@@ -11,7 +11,6 @@ import { createStreamingPlayer, parseWav, resampleAudio, SAMPLE_RATE } from "../
 import { playTTS } from "../tts/inference";
 import { fromSafetensors, runMimiEncode, type PocketTTS } from "../tts/pocket-tts";
 
-// Types for worker communication
 interface WorkerResponse {
   status: string;
   data?: string;
@@ -20,15 +19,9 @@ interface WorkerResponse {
   numTokens?: number;
   state?: "thinking" | "answering";
   file?: string;
-  progress?: number;  // percentage 0-100
-  loaded?: number;    // bytes loaded
-  total?: number;     // total bytes
-}
-
-interface Message {
-  role: "user" | "assistant";
-  content: string;
-  answerIndex?: number;
+  progress?: number;
+  loaded?: number;
+  total?: number;
 }
 
 interface ProgressItem {
@@ -111,54 +104,66 @@ function prepareTextPrompt(text: string): [string, number] {
   return [text, framesAfterEosGuess];
 }
 
-const EXAMPLES = [
-  "Tell me a short joke",
-  "Explain what WebGPU is in one sentence",
-  "Write a haiku about programming",
-];
-
 export default function LLMPage() {
   const downloadManagerRef = useRef<DownloadManagerHandle>(null);
   const workerRef = useRef<Worker | null>(null);
   const whisperWorkerRef = useRef<Worker | null>(null);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const chatContainerRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // LLM state
+  // Status
   const [llmStatus, setLlmStatus] = useState<"idle" | "loading" | "ready">("idle");
+  const [sttStatus, setSttStatus] = useState<"idle" | "loading" | "ready">("idle");
   const [loadingMessage, setLoadingMessage] = useState("");
   const [progressItems, setProgressItems] = useState<ProgressItem[]>([]);
-  const [isGenerating, setIsGenerating] = useState(false);
-  const [input, setInput] = useState("");
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [tps, setTps] = useState<number | null>(null);
-  const [numTokens, setNumTokens] = useState<number | null>(null);
+  const [sttProgressItems, setSttProgressItems] = useState<ProgressItem[]>([]);
+
+  // Display state - the main text shown
+  const [transcribedText, setTranscribedText] = useState<string | null>(null);
+  const [completionText, setCompletionText] = useState<string | null>(null);
+  const [isSpeaking, setIsSpeaking] = useState(false);
 
   // TTS state
   const [ttsEnabled, setTtsEnabled] = useState(true);
   const [ttsLoading, setTtsLoading] = useState(false);
-  const [selectedVoice, setSelectedVoice] = useState("azelma");
+  const [selectedVoice, setSelectedVoice] = useState("jean");
   const [customVoiceFile, setCustomVoiceFile] = useState<File | null>(null);
-  const [isSpeaking, setIsSpeaking] = useState(false);
+  const selectedVoiceRef = useRef(selectedVoice);
+  const customVoiceFileRef = useRef(customVoiceFile);
 
-  // STT state
-  const [sttStatus, setSttStatus] = useState<"idle" | "loading" | "ready">("idle");
-  const [micEnabled, setMicEnabled] = useState(false);
-  const [isTranscribing, setIsTranscribing] = useState(false);
-  const [sttProgressItems, setSttProgressItems] = useState<ProgressItem[]>([]);
+  // Keep refs in sync
+  useEffect(() => {
+    selectedVoiceRef.current = selectedVoice;
+  }, [selectedVoice]);
+  useEffect(() => {
+    customVoiceFileRef.current = customVoiceFile;
+  }, [customVoiceFile]);
 
   // VAD state
   const vadRef = useRef<MicVAD | null>(null);
   const [vadLoading, setVadLoading] = useState(false);
   const [vadError, setVadError] = useState<string | null>(null);
+  const [micEnabled, setMicEnabled] = useState(false);
   const [userSpeaking, setUserSpeaking] = useState(false);
 
-  // WebGPU availability (checked on client only to avoid hydration mismatch)
-  const [isWebGPUAvailable, setIsWebGPUAvailable] = useState<boolean | null>(null);
+  // Thought completion state
+  const pauseFrameCountRef = useRef(0);
+  const audioBufferRef = useRef<Float32Array[]>([]);
+  const isCompletingRef = useRef(false);
+  const speechStartTimeRef = useRef<number | null>(null);
+  const lastSpeechTimeRef = useRef<number | null>(null);
+  const currentPlayerRef = useRef<ReturnType<typeof createStreamingPlayer> | null>(null);
+  const completionAbortControllerRef = useRef<AbortController | null>(null);
+  const tokenBufferRef = useRef<string>("");
+  const interruptCompletionRef = useRef<() => void>(() => {});
+  const triggerThoughtCompletionRef = useRef<() => void>(() => {});
 
-  // Queue for TTS - speak completed responses
-  const pendingSpeechRef = useRef<string | null>(null);
+  // Thresholds
+  const PAUSE_THRESHOLD = 0.3;
+  const PAUSE_DURATION_MS = 400;
+  const MIN_SPEECH_BEFORE_COMPLETION_MS = 500;
+  const FRAME_DURATION_MS = 96;
+
+  const [isWebGPUAvailable, setIsWebGPUAvailable] = useState<boolean | null>(null);
 
   useEffect(() => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -199,9 +204,11 @@ export default function LLMPage() {
     return _tokenizer;
   }
 
-  async function speakText(text: string) {
+  async function speakText(text: string, signal?: AbortSignal) {
     if (!ttsEnabled || !text.trim()) return;
-    if (selectedVoice === "custom" && !customVoiceFile) return;
+    const voice = selectedVoiceRef.current;
+    const customFile = customVoiceFileRef.current;
+    if (voice === "custom" && !customFile) return;
 
     setIsSpeaking(true);
     try {
@@ -218,51 +225,36 @@ export default function LLMPage() {
       const tokenizer = await getTTSTokenizer();
       setTtsLoading(false);
 
+      if (signal?.aborted) return;
+
       const [preparedText, framesAfterEos] = prepareTextPrompt(text);
       const tokens = tokenizer.encode(preparedText);
 
       let voiceEmbed: np.Array;
 
-      if (selectedVoice === "custom" && customVoiceFile) {
-        // Voice cloning: encode custom audio
+      if (voice === "custom" && customFile) {
         console.log("Processing custom voice file...");
-        const arrayBuffer = await customVoiceFile.arrayBuffer();
+        const arrayBuffer = await customFile.arrayBuffer();
         const { samples, sampleRate } = parseWav(arrayBuffer);
-        console.log(`Loaded WAV: ${samples.length} samples at ${sampleRate}Hz`);
-
-        // Resample to 24kHz if needed
         const resampled = resampleAudio(samples, sampleRate, SAMPLE_RATE);
-        console.log(`Resampled to ${resampled.length} samples at ${SAMPLE_RATE}Hz`);
-
-        // Normalize to consistent peak amplitude
         let maxAbs = 0;
         for (let i = 0; i < resampled.length; i++) {
           const value = Math.abs(resampled[i]);
           if (value > maxAbs) maxAbs = value;
         }
         const normalized = maxAbs > 0 ? resampled.map((value) => value / maxAbs) : resampled;
-
-        // Create audio tensor [1, T] in float32
         const audioTensor = np.array(normalized, {
           dtype: np.float32,
           shape: [1, normalized.length],
         });
-
-        // Encode with Mimi encoder -> [512, T']
-        console.log("Encoding audio with Mimi...");
         const encoded = runMimiEncode(tree.ref(model.mimi), audioTensor);
-        console.log("Encoded shape:", encoded.shape);
-
-        // Transpose to [T', 512]
         const encodedTransposed = encoded.transpose([1, 0]);
-
-        // Project to conditioning space: [T', 512] @ [512, 1024] -> [T', 1024]
         voiceEmbed = np.dot(encodedTransposed, model.flowLM.speakerProjWeight.ref.transpose()).astype(np.float16);
-        console.log("Voice embedding shape:", voiceEmbed.shape);
       } else {
-        // Use predefined voice
+        const voiceUrl = predefinedVoices[voice];
+        console.log("Loading voice:", voice, voiceUrl);
         const audioPrompt = safetensors.parse(
-          await cachedFetch(predefinedVoices[selectedVoice])
+          await cachedFetch(voiceUrl)
         ).tensors.audio_prompt;
         voiceEmbed = np
           .array(audioPrompt.data as Float32Array<ArrayBuffer>, {
@@ -278,23 +270,75 @@ export default function LLMPage() {
       embeds = np.concatenate([voiceEmbed, embeds]);
 
       const player = createStreamingPlayer();
+      currentPlayerRef.current = player;
       try {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         await playTTS(player, tree.ref(model as any), embeds, {
           framesAfterEos,
           temperature: 0.7,
           lsdDecodeSteps: 1,
+          signal,
         });
       } finally {
         await player.close();
+        currentPlayerRef.current = null;
       }
     } catch (error) {
       console.error("TTS error:", error);
     } finally {
       setIsSpeaking(false);
       setTtsLoading(false);
+      currentPlayerRef.current = null;
     }
   }
+
+  const interruptCompletion = useCallback(() => {
+    if (isCompletingRef.current) {
+      console.log("Interrupting completion");
+      workerRef.current?.postMessage({ type: "interrupt" });
+      completionAbortControllerRef.current?.abort();
+      currentPlayerRef.current?.abort();
+      isCompletingRef.current = false;
+      setCompletionText(null);
+      tokenBufferRef.current = "";
+    }
+  }, []);
+
+  useEffect(() => {
+    interruptCompletionRef.current = interruptCompletion;
+  }, [interruptCompletion]);
+
+  const triggerThoughtCompletion = useCallback(async () => {
+    if (isCompletingRef.current || !whisperWorkerRef.current) return;
+
+    const audioFrames = audioBufferRef.current;
+    if (audioFrames.length === 0) return;
+
+    const totalLength = audioFrames.reduce((sum, frame) => sum + frame.length, 0);
+    if (totalLength < 1000) return;
+
+    const combinedAudio = new Float32Array(totalLength);
+    let offset = 0;
+    for (const frame of audioFrames) {
+      combinedAudio.set(frame, offset);
+      offset += frame.length;
+    }
+
+    isCompletingRef.current = true;
+    tokenBufferRef.current = "";
+    completionAbortControllerRef.current = new AbortController();
+
+    console.log("Triggering thought completion with", totalLength, "audio samples");
+
+    whisperWorkerRef.current.postMessage({
+      type: "generatePartial",
+      data: { audio: combinedAudio, language: "en" },
+    });
+  }, []);
+
+  useEffect(() => {
+    triggerThoughtCompletionRef.current = triggerThoughtCompletion;
+  }, [triggerThoughtCompletion]);
 
   // Initialize Whisper worker
   useEffect(() => {
@@ -330,18 +374,23 @@ export default function LLMPage() {
         case "ready":
           setSttStatus("ready");
           break;
-        case "start":
-          setIsTranscribing(true);
-          break;
-        case "update":
-          // Could show partial transcription here
-          break;
         case "complete":
-          setIsTranscribing(false);
-          if (e.data.output && typeof e.data.output === "string") {
-            const transcribed = e.data.output.trim();
-            if (transcribed) {
-              onSendMessage(transcribed);
+          // Full transcription - not used in minimalist mode
+          break;
+        case "partialComplete":
+          if (e.data.output && typeof e.data.output === "string" && isCompletingRef.current) {
+            let partialText = e.data.output.trim();
+            // Remove trailing punctuation so completion flows naturally
+            partialText = partialText.replace(/[.!?,;:]+$/, "");
+            if (partialText) {
+              console.log("Partial transcription:", partialText);
+              setTranscribedText(partialText);
+              workerRef.current?.postMessage({
+                type: "generateCompletion",
+                data: { partialText },
+              });
+            } else {
+              isCompletingRef.current = false;
             }
           }
           break;
@@ -354,74 +403,80 @@ export default function LLMPage() {
     };
   }, []);
 
-  const onSendMessage = useCallback((message: string) => {
-    setMessages((prev) => [...prev, { role: "user", content: message }]);
-    setTps(null);
-    setNumTokens(null);
-    setIsGenerating(true);
-    setInput("");
-  }, []);
-
-  // Store whisper worker ref for VAD callback
   const whisperWorkerForVad = whisperWorkerRef;
 
-  // Toggle mic on/off - initializes VAD on first click
   async function toggleMic() {
-    if (vadLoading) {
-      console.log("VAD still loading...");
-      return;
-    }
-    if (vadError) {
-      console.error("VAD has an error, cannot start:", vadError);
-      return;
-    }
+    if (vadLoading || vadError) return;
 
     if (micEnabled) {
-      // Pause VAD
-      if (vadRef.current) {
-        await vadRef.current.pause();
-      }
+      if (vadRef.current) await vadRef.current.pause();
       setMicEnabled(false);
       setUserSpeaking(false);
     } else {
-      // Start or initialize VAD
       if (vadRef.current) {
-        // Already initialized, just start
         await vadRef.current.start();
         setMicEnabled(true);
       } else {
-        // First time - initialize VAD
         setVadLoading(true);
         try {
-          console.log("Initializing VAD...");
           const vad = await MicVAD.new({
-            startOnLoad: true, // Start immediately after initialization
+            startOnLoad: true,
             baseAssetPath: "/",
             onnxWASMBasePath: "/",
-            onSpeechEnd: (audio) => {
-              console.log("Speech ended, sending to Whisper");
+            onSpeechEnd: () => {
               setUserSpeaking(false);
-              whisperWorkerForVad.current?.postMessage({
-                type: "generate",
-                data: { audio, language: "en" },
-              });
+              audioBufferRef.current = [];
+              pauseFrameCountRef.current = 0;
+              speechStartTimeRef.current = null;
+              lastSpeechTimeRef.current = null;
             },
             onSpeechStart: () => {
-              console.log("Speech started");
               setUserSpeaking(true);
+              speechStartTimeRef.current = performance.now();
+              audioBufferRef.current = [];
+              pauseFrameCountRef.current = 0;
+              setTranscribedText(null);
+              setCompletionText(null);
+              interruptCompletionRef.current();
             },
-            onFrameProcessed: (probs) => {
-              // Update speaking state based on speech probability
+            onFrameProcessed: (probs, audioFrame) => {
+              const now = performance.now();
+
               if (probs.isSpeech > 0.6) {
                 setUserSpeaking(true);
+                lastSpeechTimeRef.current = now;
+                pauseFrameCountRef.current = 0;
+                if (audioFrame) {
+                  audioBufferRef.current.push(new Float32Array(audioFrame));
+                }
+              } else if (probs.isSpeech < PAUSE_THRESHOLD) {
+                pauseFrameCountRef.current++;
+                if (audioFrame && pauseFrameCountRef.current < 10) {
+                  audioBufferRef.current.push(new Float32Array(audioFrame));
+                }
+
+                const pauseDuration = pauseFrameCountRef.current * FRAME_DURATION_MS;
+                const speechDuration = speechStartTimeRef.current
+                  ? now - speechStartTimeRef.current
+                  : 0;
+
+                if (
+                  pauseDuration >= PAUSE_DURATION_MS &&
+                  speechDuration >= MIN_SPEECH_BEFORE_COMPLETION_MS &&
+                  !isCompletingRef.current
+                ) {
+                  triggerThoughtCompletionRef.current();
+                }
+              }
+
+              if (probs.isSpeech > 0.6 && isCompletingRef.current) {
+                interruptCompletionRef.current();
               }
             },
           });
           vadRef.current = vad;
           setMicEnabled(true);
-          console.log("VAD initialized and started");
         } catch (error) {
-          console.error("Failed to initialize VAD:", error);
           setVadError(error instanceof Error ? error.message : String(error));
         } finally {
           setVadLoading(false);
@@ -430,7 +485,6 @@ export default function LLMPage() {
     }
   }
 
-  // Cleanup VAD on unmount
   useEffect(() => {
     return () => {
       if (vadRef.current) {
@@ -439,18 +493,7 @@ export default function LLMPage() {
     };
   }, []);
 
-  function onInterrupt() {
-    workerRef.current?.postMessage({ type: "interrupt" });
-  }
-
-  useEffect(() => {
-    if (!textareaRef.current) return;
-    const target = textareaRef.current;
-    target.style.height = "auto";
-    const newHeight = Math.min(Math.max(target.scrollHeight, 24), 200);
-    target.style.height = `${newHeight}px`;
-  }, [input]);
-
+  // LLM worker
   useEffect(() => {
     if (!workerRef.current) {
       workerRef.current = new Worker(new URL("./worker.ts", import.meta.url), {
@@ -486,46 +529,25 @@ export default function LLMPage() {
         case "ready":
           setLlmStatus("ready");
           break;
-        case "start":
-          setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
-          break;
         case "update":
-          setTps(e.data.tps || null);
-          setNumTokens(e.data.numTokens || null);
-          setMessages((prev) => {
-            const cloned = [...prev];
-            const last = cloned.at(-1);
-            if (last && last.role === "assistant") {
-              const data: Message = {
-                ...last,
-                content: last.content + (e.data.output || ""),
-              };
-              if (data.answerIndex === undefined && e.data.state === "answering") {
-                data.answerIndex = last.content.length;
-              }
-              cloned[cloned.length - 1] = data;
-            }
-            return cloned;
-          });
+          if (isCompletingRef.current && e.data.output) {
+            tokenBufferRef.current += e.data.output;
+            setCompletionText(tokenBufferRef.current);
+          }
           break;
         case "complete":
-          setIsGenerating(false);
-          // Get the final assistant message and queue it for TTS
-          setMessages((prev) => {
-            const lastMsg = prev.at(-1);
-            if (lastMsg?.role === "assistant" && lastMsg.content) {
-              // Extract just the answer part (after thinking)
-              const answerText = lastMsg.answerIndex !== undefined
-                ? lastMsg.content.slice(lastMsg.answerIndex)
-                : lastMsg.content;
-              pendingSpeechRef.current = answerText;
+          if (isCompletingRef.current) {
+            const completionResult = tokenBufferRef.current.trim();
+            console.log("Completion finished:", completionResult);
+
+            if (completionResult && !completionAbortControllerRef.current?.signal.aborted) {
+              const signal = completionAbortControllerRef.current?.signal;
+              speakText(completionResult, signal);
             }
-            return prev;
-          });
-          break;
-        case "error":
-          console.error("Worker error:", e.data.data);
-          setIsGenerating(false);
+
+            isCompletingRef.current = false;
+            tokenBufferRef.current = "";
+          }
           break;
       }
     };
@@ -536,161 +558,59 @@ export default function LLMPage() {
     };
   }, []);
 
-  // Trigger generation when user sends message
-  useEffect(() => {
-    if (messages.filter((x) => x.role === "user").length === 0) return;
-    if (messages.at(-1)?.role === "assistant") return;
-    workerRef.current?.postMessage({
-      type: "generate",
-      data: { messages, reasonEnabled: false },
-    });
-  }, [messages]);
-
-  // Auto-scroll chat
-  useEffect(() => {
-    if (!chatContainerRef.current || !isGenerating) return;
-    const element = chatContainerRef.current;
-    if (element.scrollHeight - element.scrollTop - element.clientHeight < 120) {
-      element.scrollTop = element.scrollHeight;
-    }
-  }, [messages, isGenerating]);
-
-  // Speak completed responses
-  useEffect(() => {
-    if (!isGenerating && pendingSpeechRef.current && ttsEnabled && !isSpeaking) {
-      const text = pendingSpeechRef.current;
-      pendingSpeechRef.current = null;
-      speakText(text);
-    }
-  }, [isGenerating, ttsEnabled, isSpeaking]);
-
-  function handleSubmit(e: FormEvent) {
-    e.preventDefault();
-    if (input.trim() && !isGenerating) {
-      onSendMessage(input.trim());
-    }
-  }
-
-  // Show loading while checking WebGPU
   if (isWebGPUAvailable === null) {
     return (
-      <div className="flex items-center justify-center h-screen">
-        <Loader2 className="w-8 h-8 animate-spin text-zinc-400" />
+      <div className="flex items-center justify-center h-screen bg-zinc-950">
+        <Loader2 className="w-6 h-6 animate-spin text-zinc-600" />
       </div>
     );
   }
 
   if (!isWebGPUAvailable) {
     return (
-      <div className="fixed inset-0 bg-black/90 text-white text-2xl font-semibold flex justify-center items-center text-center p-4">
-        WebGPU is not supported by this browser
+      <div className="flex items-center justify-center h-screen bg-zinc-950 text-zinc-400 text-sm">
+        WebGPU is not supported
       </div>
     );
   }
+
+  const isLoading = llmStatus === "loading" || sttStatus === "loading";
+  const isReady = llmStatus === "ready" && sttStatus === "ready";
+  const isIdle = llmStatus === "idle" || sttStatus === "idle";
 
   return (
     <>
       <DownloadManager ref={downloadManagerRef} />
 
-      <main className="flex flex-col h-screen bg-white dark:bg-zinc-900">
-        {/* Header */}
-        <header className="border-b border-zinc-200 dark:border-zinc-700 p-4">
-          <div className="max-w-3xl mx-auto flex items-center justify-between">
-            <h1 className="text-xl font-semibold flex items-center gap-2">
-              <MessageSquare className="w-5 h-5" />
-              Local LLM + TTS
-            </h1>
-            <div className="flex items-center gap-2">
-              <select
-                className="text-sm border rounded px-2 py-1 bg-white dark:bg-zinc-800 dark:border-zinc-600"
-                value={selectedVoice}
-                onChange={(e) => setSelectedVoice(e.target.value)}
-                disabled={isSpeaking}
-              >
-                {Object.keys(predefinedVoices).map((voice) => (
-                  <option key={voice} value={voice}>
-                    {voice.charAt(0).toUpperCase() + voice.slice(1)}
-                  </option>
-                ))}
-                <option value="custom">Custom Voice</option>
-              </select>
-
-              {selectedVoice === "custom" && (
-                <>
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    accept="audio/wav,.wav"
-                    className="hidden"
-                    onChange={(e) => setCustomVoiceFile(e.target.files?.[0] || null)}
-                  />
-                  <button
-                    type="button"
-                    onClick={() => fileInputRef.current?.click()}
-                    disabled={isSpeaking}
-                    className="text-sm border rounded px-2 py-1 bg-white dark:bg-zinc-800 dark:border-zinc-600 hover:bg-zinc-100 dark:hover:bg-zinc-700 flex items-center gap-1"
-                  >
-                    <Upload className="w-4 h-4" />
-                    {customVoiceFile ? customVoiceFile.name.slice(0, 10) + "..." : "Upload WAV"}
-                  </button>
-                </>
-              )}
-
-              <button
-                onClick={() => setTtsEnabled(!ttsEnabled)}
-                className={`p-2 rounded-lg transition-colors ${
-                  ttsEnabled
-                    ? "bg-blue-100 text-blue-600 dark:bg-blue-900 dark:text-blue-300"
-                    : "bg-zinc-100 text-zinc-400 dark:bg-zinc-800"
-                }`}
-                title={ttsEnabled ? "TTS enabled" : "TTS disabled"}
-              >
-                {ttsEnabled ? <Volume2 className="w-5 h-5" /> : <VolumeX className="w-5 h-5" />}
-              </button>
-            </div>
-          </div>
-        </header>
-
+      <main className="flex flex-col h-screen bg-zinc-950 text-zinc-100">
         {/* Loading state */}
-        {(llmStatus === "idle" || sttStatus === "idle") && llmStatus !== "loading" && sttStatus !== "loading" && (
-          <div className="flex-1 flex flex-col items-center justify-center p-8">
-            <h2 className="text-2xl font-bold mb-2">Voice Chat with Local AI</h2>
-            <p className="text-zinc-500 dark:text-zinc-400 text-center max-w-md mb-6">
-              Speak to a local LLM running in your browser. Uses Whisper for speech-to-text, Qwen3 for responses, and Pocket TTS for voice output.
-            </p>
+        {isIdle && !isLoading && (
+          <div className="flex-1 flex flex-col items-center justify-center">
             <button
               onClick={() => {
                 workerRef.current?.postMessage({ type: "load" });
                 whisperWorkerRef.current?.postMessage({ type: "load" });
               }}
-              className="px-6 py-3 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors font-medium"
+              className="px-4 py-2 text-sm text-zinc-400 border border-zinc-800 rounded-lg hover:border-zinc-600 hover:text-zinc-300 transition-colors"
             >
               Load Models
             </button>
           </div>
         )}
 
-        {(llmStatus === "loading" || sttStatus === "loading") && (
-          <div className="flex-1 flex flex-col items-center justify-center p-8">
-            <Loader2 className="w-8 h-8 animate-spin mb-4 text-blue-500" />
-            <p className="text-zinc-600 dark:text-zinc-400 mb-4">{loadingMessage || "Loading models..."}</p>
-            <div className="w-full max-w-md space-y-2">
-              {[
-                ...progressItems.map((p, i) => ({ ...p, key: `llm-${i}-${p.file}` })),
-                ...sttProgressItems.map((p, i) => ({ ...p, key: `stt-${i}-${p.file}` }))
-              ].map(({ file, progress, total, key }) => (
-                <div key={key} className="text-sm">
-                  <div className="text-zinc-500 dark:text-zinc-400 mb-1 truncate">{file}</div>
-                  <div className="w-full bg-zinc-200 dark:bg-zinc-700 rounded-full h-2">
+        {isLoading && (
+          <div className="flex-1 flex flex-col items-center justify-center gap-4">
+            <Loader2 className="w-5 h-5 animate-spin text-zinc-600" />
+            <p className="text-xs text-zinc-600">{loadingMessage || "Loading..."}</p>
+            <div className="w-64 space-y-2">
+              {[...progressItems, ...sttProgressItems].map(({ file, progress, total }, i) => (
+                <div key={i} className="text-xs">
+                  <div className="text-zinc-700 truncate mb-1">{file}</div>
+                  <div className="w-full bg-zinc-900 rounded-full h-1">
                     <div
-                      className="bg-blue-500 h-2 rounded-full transition-all"
+                      className="bg-zinc-700 h-1 rounded-full transition-all"
                       style={{ width: total > 0 ? `${(progress / total) * 100}%` : "0%" }}
                     />
-                  </div>
-                  <div className="text-xs text-zinc-400 mt-1">
-                    {total > 0
-                      ? `${(progress / 1024 / 1024).toFixed(1)} / ${(total / 1024 / 1024).toFixed(1)} MB`
-                      : `${(progress / 1024 / 1024).toFixed(1)} MB`}
                   </div>
                 </div>
               ))}
@@ -698,188 +618,108 @@ export default function LLMPage() {
           </div>
         )}
 
-        {/* Chat interface */}
-        {llmStatus === "ready" && sttStatus === "ready" && (
+        {/* Main view */}
+        {isReady && (
           <>
-            <div ref={chatContainerRef} className="flex-1 overflow-y-auto p-4">
-              <div className="max-w-3xl mx-auto space-y-4">
-                {messages.length === 0 && (
-                  <div className="text-center py-12">
-                    <div className="mb-8">
-                      <Mic className="w-12 h-12 mx-auto mb-4 text-zinc-400" />
-                      <p className="text-zinc-500 dark:text-zinc-400">
-                        Press the microphone button and speak, or type a message
-                      </p>
-                    </div>
-                    <p className="text-zinc-500 dark:text-zinc-400 mb-4 text-sm">Or try one of these:</p>
-                    <div className="flex flex-wrap justify-center gap-2">
-                      {EXAMPLES.map((example) => (
-                        <button
-                          key={example}
-                          onClick={() => onSendMessage(example)}
-                          className="px-4 py-2 bg-zinc-100 dark:bg-zinc-800 rounded-lg hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors text-sm"
-                        >
-                          {example}
-                        </button>
-                      ))}
-                    </div>
+            {/* Centered text display */}
+            <div className="flex-1 flex items-center justify-center px-8">
+              <div className="max-w-2xl text-center">
+                {!transcribedText && !completionText && !userSpeaking && (
+                  <p className="text-zinc-700 text-sm">
+                    {micEnabled ? "Listening..." : "Click mic to start"}
+                  </p>
+                )}
+
+                {userSpeaking && !transcribedText && (
+                  <div className="flex items-center justify-center gap-2 text-zinc-500">
+                    <div className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
                   </div>
                 )}
 
-                {messages.map((msg, i) => (
-                  <div
-                    key={i}
-                    className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
-                  >
-                    <div
-                      className={`max-w-[80%] rounded-lg px-4 py-2 ${
-                        msg.role === "user"
-                          ? "bg-blue-500 text-white"
-                          : "bg-zinc-100 dark:bg-zinc-800"
-                      }`}
-                    >
-                      <p className="whitespace-pre-wrap">{msg.content || (isGenerating && i === messages.length - 1 ? "..." : "")}</p>
-                    </div>
-                  </div>
-                ))}
+                {(transcribedText || completionText) && (
+                  <p className="text-2xl leading-relaxed">
+                    <span className="text-zinc-300">{transcribedText}</span>
+                    {completionText && (
+                      <span className="text-zinc-500 italic"> {completionText}</span>
+                    )}
+                  </p>
+                )}
 
                 {isSpeaking && (
-                  <div className="flex justify-start">
-                    <div className="flex items-center gap-2 text-sm text-zinc-500 dark:text-zinc-400">
-                      <Volume2 className="w-4 h-4 animate-pulse" />
-                      Speaking...
-                    </div>
-                  </div>
-                )}
-
-                {ttsLoading && (
-                  <div className="flex justify-start">
-                    <div className="flex items-center gap-2 text-sm text-zinc-500 dark:text-zinc-400">
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                      Loading TTS model...
-                    </div>
+                  <div className="mt-4 flex items-center justify-center gap-2 text-zinc-600 text-xs">
+                    <Volume2 className="w-3 h-3 animate-pulse" />
                   </div>
                 )}
               </div>
             </div>
 
-            {/* Stats bar */}
-            {tps && (
-              <div className="text-center text-sm text-zinc-500 dark:text-zinc-400 py-1">
-                {isGenerating ? (
-                  <span>{tps.toFixed(1)} tokens/sec</span>
-                ) : (
-                  <span>
-                    Generated {numTokens} tokens ({tps.toFixed(1)} tokens/sec)
-                    {" · "}
-                    <button
-                      onClick={() => {
-                        workerRef.current?.postMessage({ type: "reset" });
-                        setMessages([]);
-                      }}
-                      className="underline hover:text-zinc-700 dark:hover:text-zinc-300"
-                    >
-                      Reset
-                    </button>
-                  </span>
-                )}
-              </div>
-            )}
+            {/* Bottom controls */}
+            <div className="p-6">
+              <div className="max-w-md mx-auto flex items-center justify-center gap-4">
+                {/* Mic button */}
+                <button
+                  onClick={toggleMic}
+                  disabled={vadLoading}
+                  className={`p-3 rounded-full transition-all ${
+                    micEnabled
+                      ? userSpeaking
+                        ? "bg-red-500/20 text-red-400"
+                        : "bg-zinc-800 text-zinc-300"
+                      : "bg-zinc-900 text-zinc-600 hover:bg-zinc-800 hover:text-zinc-400"
+                  }`}
+                >
+                  {vadLoading ? (
+                    <Loader2 className="w-5 h-5 animate-spin" />
+                  ) : micEnabled ? (
+                    <Mic className="w-5 h-5" />
+                  ) : (
+                    <MicOff className="w-5 h-5" />
+                  )}
+                </button>
 
-            {/* Input area */}
-            <div className="border-t border-zinc-200 dark:border-zinc-700 p-4">
-              <div className="max-w-3xl mx-auto">
-                {/* Status indicators */}
-                {(isTranscribing || userSpeaking) && (
-                  <div className="flex items-center gap-2 text-sm text-zinc-500 dark:text-zinc-400 mb-2">
-                    {userSpeaking ? (
-                      <>
-                        <Mic className="w-4 h-4 text-red-500 animate-pulse" />
-                        Listening...
-                      </>
-                    ) : (
-                      <>
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                        Transcribing...
-                      </>
-                    )}
-                  </div>
-                )}
+                {/* Voice selector */}
+                <select
+                  value={selectedVoice}
+                  onChange={(e) => setSelectedVoice(e.target.value)}
+                  disabled={isSpeaking}
+                  className="text-xs bg-transparent border border-zinc-800 rounded px-2 py-1.5 text-zinc-500 focus:outline-none focus:border-zinc-600"
+                >
+                  {Object.keys(predefinedVoices).map((voice) => (
+                    <option key={voice} value={voice} className="bg-zinc-900">
+                      {voice}
+                    </option>
+                  ))}
+                  <option value="custom" className="bg-zinc-900">custom</option>
+                </select>
 
-                <div className="flex gap-2 items-center">
-                  {/* Mic button */}
-                  <button
-                    type="button"
-                    onClick={toggleMic}
-                    disabled={isGenerating || isTranscribing || isSpeaking || vadLoading || !!vadError}
-                    className={`p-3 rounded-full transition-colors ${
-                      vadLoading
-                        ? "bg-yellow-100 dark:bg-yellow-900 text-yellow-600"
-                        : vadError
-                        ? "bg-red-100 dark:bg-red-900 text-red-600"
-                        : micEnabled
-                        ? userSpeaking
-                          ? "bg-red-500 text-white animate-pulse"
-                          : "bg-green-500 text-white"
-                        : "bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700"
-                    } disabled:opacity-50 disabled:cursor-not-allowed`}
-                    title={
-                      vadLoading
-                        ? "Loading VAD..."
-                        : vadError
-                        ? `VAD Error: ${vadError}`
-                        : micEnabled
-                        ? userSpeaking
-                          ? "Speaking..."
-                          : "Mic on - click to disable"
-                        : "Click to enable mic"
-                    }
-                  >
-                    {vadLoading ? (
-                      <Loader2 className="w-6 h-6 animate-spin" />
-                    ) : micEnabled ? (
-                      <Mic className="w-6 h-6" />
-                    ) : (
-                      <MicOff className="w-6 h-6" />
-                    )}
-                  </button>
-
-                  {/* Text input */}
-                  <form onSubmit={handleSubmit} className="flex-1 flex gap-2">
-                    <textarea
-                      ref={textareaRef}
-                      value={input}
-                      onChange={(e) => setInput(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" && !e.shiftKey && input.trim() && !isGenerating) {
-                          e.preventDefault();
-                          onSendMessage(input.trim());
-                        }
-                      }}
-                      placeholder="Speak or type a message..."
-                      rows={1}
-                      className="flex-1 resize-none rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                      disabled={isGenerating || userSpeaking}
+                {selectedVoice === "custom" && (
+                  <>
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      accept="audio/wav,.wav"
+                      className="hidden"
+                      onChange={(e) => setCustomVoiceFile(e.target.files?.[0] || null)}
                     />
-                    {isGenerating ? (
-                      <button
-                        type="button"
-                        onClick={onInterrupt}
-                        className="px-4 py-2 bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors"
-                      >
-                        <Square className="w-5 h-5" />
-                      </button>
-                    ) : (
-                      <button
-                        type="submit"
-                        disabled={!input.trim() || userSpeaking}
-                        className="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                      >
-                        <Send className="w-5 h-5" />
-                      </button>
-                    )}
-                  </form>
-                </div>
+                    <button
+                      onClick={() => fileInputRef.current?.click()}
+                      disabled={isSpeaking}
+                      className="text-xs text-zinc-600 hover:text-zinc-400"
+                    >
+                      {customVoiceFile ? customVoiceFile.name.slice(0, 8) + "..." : "upload"}
+                    </button>
+                  </>
+                )}
+
+                {/* TTS toggle */}
+                <button
+                  onClick={() => setTtsEnabled(!ttsEnabled)}
+                  className={`p-2 rounded transition-colors ${
+                    ttsEnabled ? "text-zinc-400" : "text-zinc-700"
+                  }`}
+                >
+                  {ttsEnabled ? <Volume2 className="w-4 h-4" /> : <VolumeX className="w-4 h-4" />}
+                </button>
               </div>
             </div>
           </>

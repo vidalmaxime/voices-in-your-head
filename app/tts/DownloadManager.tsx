@@ -3,7 +3,7 @@
 import { useState, useCallback, forwardRef, useImperativeHandle } from "react";
 
 export interface DownloadManagerHandle {
-  fetch: (label: string, url: string) => Promise<ArrayBuffer>;
+  fetch: (label: string, url: string, headers?: Record<string, string>) => Promise<ArrayBuffer>;
 }
 
 interface DownloadState {
@@ -15,7 +15,7 @@ interface DownloadState {
 const DownloadManager = forwardRef<DownloadManagerHandle>(function DownloadManager(_, ref) {
   const [downloads, setDownloads] = useState<Map<string, DownloadState>>(new Map());
 
-  const fetchWithProgress = useCallback(async (label: string, url: string): Promise<ArrayBuffer> => {
+  const fetchWithProgress = useCallback(async (label: string, url: string, headers?: Record<string, string>): Promise<ArrayBuffer> => {
     setDownloads(prev => {
       const next = new Map(prev);
       next.set(url, { label, progress: 0, total: 0 });
@@ -23,7 +23,7 @@ const DownloadManager = forwardRef<DownloadManagerHandle>(function DownloadManag
     });
 
     try {
-      const response = await fetch(url);
+      const response = await fetch(url, headers ? { headers } : undefined);
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`);
       }

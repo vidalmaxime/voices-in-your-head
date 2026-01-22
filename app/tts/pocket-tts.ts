@@ -963,12 +963,34 @@ const weightMapper = new WeightMapper({
   autoCamelCase: true,
 });
 
+/** Convert BF16 (bfloat16) data to FP16 (float16). */
+function bf16ToFp16(bf16Data: Uint16Array): Float16Array {
+  const fp16Data = new Float16Array(bf16Data.length);
+  const f32View = new Float32Array(1);
+  const u32View = new Uint32Array(f32View.buffer);
+
+  for (let i = 0; i < bf16Data.length; i++) {
+    // BF16 to F32: shift left 16 bits (BF16 is upper 16 bits of F32)
+    u32View[0] = bf16Data[i] << 16;
+    // F32 to F16: Float16Array handles the conversion
+    fp16Data[i] = f32View[0];
+  }
+  return fp16Data;
+}
+
 export function fromSafetensors(file: safetensors.File): PocketTTS {
   const mappedWeights = weightMapper.mapObject(file.tensors);
   const hydrated: Record<string, np.Array> = {};
   for (const [key, value] of Object.entries(mappedWeights)) {
     if (value.dtype === "F16") {
       hydrated[key] = np.array(value.data as Float16Array<ArrayBuffer>, {
+        dtype: np.float16,
+        shape: value.shape,
+      });
+    } else if (value.dtype === "BF16") {
+      // Convert BF16 to FP16
+      const fp16Data = bf16ToFp16(new Uint16Array(value.data.buffer, value.data.byteOffset, value.data.length / 2));
+      hydrated[key] = np.array(fp16Data, {
         dtype: np.float16,
         shape: value.shape,
       });

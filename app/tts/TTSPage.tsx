@@ -12,6 +12,43 @@ import { fromSafetensors, type PocketTTS } from "./pocket-tts";
 
 // Cached large objects to download.
 let _weights: safetensors.File | null = null;
+
+/** Parse safetensors file, converting BF16 tensors to FP16 */
+function parseSafetensorsWithBF16(data: ArrayBuffer): safetensors.File {
+  const view = new DataView(data);
+  const headerLen = Number(view.getBigUint64(0, true));
+  const headerBytes = new Uint8Array(data, 8, headerLen);
+  const headerStr = new TextDecoder().decode(headerBytes);
+  const header = JSON.parse(headerStr) as Record<string, { dtype: string; shape: number[]; data_offsets: [number, number] }>;
+
+  const dataOffset = 8 + headerLen;
+  const tensors: Record<string, { dtype: string; shape: number[]; data: Uint8Array | Float16Array }> = {};
+
+  for (const [name, meta] of Object.entries(header)) {
+    if (name === "__metadata__") continue;
+    const [start, end] = meta.data_offsets;
+    const tensorData = new Uint8Array(data, dataOffset + start, end - start);
+
+    if (meta.dtype === "BF16") {
+      // Convert BF16 to FP16
+      const bf16 = new Uint16Array(tensorData.buffer, tensorData.byteOffset, tensorData.byteLength / 2);
+      const fp16 = new Float16Array(bf16.length);
+      const f32 = new Float32Array(1);
+      const u32 = new Uint32Array(f32.buffer);
+      for (let i = 0; i < bf16.length; i++) {
+        u32[0] = bf16[i] << 16;
+        fp16[i] = f32[0];
+      }
+      tensors[name] = { dtype: "F16", shape: meta.shape, data: fp16 };
+    } else if (meta.dtype === "F16") {
+      tensors[name] = { dtype: "F16", shape: meta.shape, data: new Float16Array(tensorData.buffer, tensorData.byteOffset, tensorData.byteLength / 2) };
+    } else {
+      tensors[name] = { dtype: meta.dtype, shape: meta.shape, data: tensorData };
+    }
+  }
+
+  return { tensors } as safetensors.File;
+}
 let _model: PocketTTS | null = null;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let _tokenizer: any | null = null;
@@ -75,15 +112,17 @@ export default function TTSPage() {
   async function downloadClipWeights(): Promise<safetensors.File> {
     if (_weights) return _weights;
     const weightsUrl =
-      "https://huggingface.co/ekzhang/jax-js-models/resolve/main/kyutai-pocket-tts_b6369a24-fp16.safetensors";
+      "https://huggingface.co/kyutai/pocket-tts/resolve/main/tts_b6369a24.safetensors";
 
     if (!downloadManagerRef.current) {
       throw new Error("Download manager not initialized");
     }
 
     try {
-      const data = await downloadManagerRef.current.fetch("model weights", weightsUrl);
-      const result = safetensors.parse(data);
+      const data = await downloadManagerRef.current.fetch("model weights", weightsUrl, {
+        Authorization: "Bearer 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",
+      });
+      const result = parseSafetensorsWithBF16(data);
       _weights = result;
       return result;
     } catch (error) {

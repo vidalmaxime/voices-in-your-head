@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@bufbuild/protobuf": "^2.11.0",
+    "@huggingface/transformers": "^3.8.1",
     "@jax-js/jax": "^0.1.6",
     "@jax-js/loaders": "^0.1.0",
     "lucide-react": "^0.562.0",

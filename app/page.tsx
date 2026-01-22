@@ -1,5 +1,5 @@
-import TTSPage from "./tts/TTSPage";
+import LLMPage from "./llm/LLMPage";
 
 export default function Home() {
-  return <TTSPage />;
+  return <LLMPage />;
 }

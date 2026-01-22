@@ -13,6 +13,7 @@
     "@huggingface/transformers": "^3.8.1",
     "@jax-js/jax": "^0.1.6",
     "@jax-js/loaders": "^0.1.0",
+    "@ricky0123/vad-react": "^0.0.36",
     "lucide-react": "^0.562.0",
     "next": "16.1.4",
     "react": "19.2.3",

@@ -1,6 +1,114 @@
 // Audio playback utilities for TTS output.
 
-const SAMPLE_RATE = 24000; // 24kHz sample rate for Mimi codec
+export const SAMPLE_RATE = 24000; // 24kHz sample rate for Mimi codec
+
+/** Parse a WAV file and return Float32Array samples (mono, normalized to [-1, 1]). */
+export function parseWav(buffer: ArrayBuffer): { samples: Float32Array; sampleRate: number } {
+  const view = new DataView(buffer);
+
+  // Verify RIFF header
+  const riff = String.fromCharCode(view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3));
+  if (riff !== "RIFF") throw new Error("Not a valid WAV file (missing RIFF header)");
+
+  const wave = String.fromCharCode(view.getUint8(8), view.getUint8(9), view.getUint8(10), view.getUint8(11));
+  if (wave !== "WAVE") throw new Error("Not a valid WAV file (missing WAVE format)");
+
+  // Find fmt chunk
+  let offset = 12;
+  let audioFormat = 0, numChannels = 0, sampleRate = 0, bitsPerSample = 0;
+
+  while (offset < buffer.byteLength) {
+    const chunkId = String.fromCharCode(
+      view.getUint8(offset), view.getUint8(offset + 1),
+      view.getUint8(offset + 2), view.getUint8(offset + 3)
+    );
+    const chunkSize = view.getUint32(offset + 4, true);
+
+    if (chunkId === "fmt ") {
+      audioFormat = view.getUint16(offset + 8, true);
+      numChannels = view.getUint16(offset + 10, true);
+      sampleRate = view.getUint32(offset + 12, true);
+      bitsPerSample = view.getUint16(offset + 22, true);
+    } else if (chunkId === "data") {
+      const dataOffset = offset + 8;
+      const dataSize = chunkSize;
+
+      if (audioFormat !== 1 && audioFormat !== 3) {
+        throw new Error(`Unsupported audio format: ${audioFormat} (only PCM supported)`);
+      }
+
+      let samples: Float32Array;
+
+      if (audioFormat === 3) {
+        // IEEE float
+        samples = new Float32Array(buffer, dataOffset, dataSize / 4);
+      } else if (bitsPerSample === 16) {
+        const int16 = new Int16Array(buffer, dataOffset, dataSize / 2);
+        samples = new Float32Array(int16.length);
+        for (let i = 0; i < int16.length; i++) {
+          samples[i] = int16[i] / 32768;
+        }
+      } else if (bitsPerSample === 24) {
+        const numSamples = dataSize / 3;
+        samples = new Float32Array(numSamples);
+        for (let i = 0; i < numSamples; i++) {
+          const b0 = view.getUint8(dataOffset + i * 3);
+          const b1 = view.getUint8(dataOffset + i * 3 + 1);
+          const b2 = view.getInt8(dataOffset + i * 3 + 2);
+          const value = (b2 << 16) | (b1 << 8) | b0;
+          samples[i] = value / 8388608;
+        }
+      } else if (bitsPerSample === 32) {
+        const int32 = new Int32Array(buffer, dataOffset, dataSize / 4);
+        samples = new Float32Array(int32.length);
+        for (let i = 0; i < int32.length; i++) {
+          samples[i] = int32[i] / 2147483648;
+        }
+      } else {
+        throw new Error(`Unsupported bits per sample: ${bitsPerSample}`);
+      }
+
+      // Convert to mono by averaging channels
+      if (numChannels > 1) {
+        const mono = new Float32Array(samples.length / numChannels);
+        for (let i = 0; i < mono.length; i++) {
+          let sum = 0;
+          for (let c = 0; c < numChannels; c++) {
+            sum += samples[i * numChannels + c];
+          }
+          mono[i] = sum / numChannels;
+        }
+        return { samples: mono, sampleRate };
+      }
+
+      return { samples, sampleRate };
+    }
+
+    offset += 8 + chunkSize;
+    if (chunkSize % 2 !== 0) offset++; // Pad byte
+  }
+
+  throw new Error("No data chunk found in WAV file");
+}
+
+/** Resample audio to a target sample rate using linear interpolation. */
+export function resampleAudio(samples: Float32Array, fromRate: number, toRate: number): Float32Array {
+  if (fromRate === toRate) return samples;
+
+  const ratio = fromRate / toRate;
+  const newLength = Math.floor(samples.length / ratio);
+  const result = new Float32Array(newLength);
+
+  for (let i = 0; i < newLength; i++) {
+    const srcIndex = i * ratio;
+    const srcIndexFloor = Math.floor(srcIndex);
+    const srcIndexCeil = Math.min(srcIndexFloor + 1, samples.length - 1);
+    const t = srcIndex - srcIndexFloor;
+    result[i] = samples[srcIndexFloor] * (1 - t) + samples[srcIndexCeil] * t;
+  }
+
+  return result;
+}
 
 export interface AudioPlayer {
   /** Play a chunk of PCM samples (Float32Array in range [-1, 1]). */

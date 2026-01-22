@@ -596,9 +596,10 @@ export function runMimiEncode(
   offset.dispose();
   x = x.transpose([1, 0]); // back to [C, T]
 
-  // Downsample (stride 16)
+  // Downsample (stride 16) - need batch dim for conv
+  x = np.expandDims(x, 0); // [C, T] -> [1, C, T]
   [x] = runConv1d(downsample.conv, null, x, 16);
-  return x;
+  return x.slice(0); // [1, C, T'] -> [C, T']
 }
 
 export type MimiDecodeState = {
@@ -953,6 +954,7 @@ const weightMapper = new WeightMapper({
     ".conditioner.embed.weight": ".conditionerEmbed",
     ".layer_scale_1.scale": ".layerScale1",
     ".layer_scale_2.scale": ".layerScale2",
+    ".speaker_proj.weight": ".speakerProjWeight",
   },
   substring: {
     ".conv.conv.": ".conv.",

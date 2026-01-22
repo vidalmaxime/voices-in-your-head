@@ -3,12 +3,12 @@
 import { useState, useRef, FormEvent } from "react";
 import { defaultDevice, init, numpy as np, tree } from "@jax-js/jax";
 import { cachedFetch, safetensors, tokenizers } from "@jax-js/loaders";
-import { AudioLines, Download, Github } from "lucide-react";
+import { AudioLines, Download, Github, Upload } from "lucide-react";
 
 import DownloadManager, { DownloadManagerHandle } from "./DownloadManager";
-import { createStreamingPlayer } from "./audio";
+import { createStreamingPlayer, parseWav, resampleAudio, SAMPLE_RATE } from "./audio";
 import { playTTS } from "./inference";
-import { fromSafetensors, type PocketTTS } from "./pocket-tts";
+import { fromSafetensors, runMimiEncode, type PocketTTS } from "./pocket-tts";
 
 // Cached large objects to download.
 let _weights: safetensors.File | null = null;
@@ -101,8 +101,10 @@ export default function TTSPage() {
 
   const [prompt, setPrompt] = useState("The sun is shining, and the birds are singing.");
   const [selectedVoice, setSelectedVoice] = useState("azelma");
+  const [customVoiceFile, setCustomVoiceFile] = useState<File | null>(null);
   const [playing, setPlaying] = useState(false);
   const [audioBlob, setAudioBlob] = useState<Blob | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Advanced options
   const [seed, setSeed] = useState<number | null>(null);
@@ -165,16 +167,49 @@ export default function TTSPage() {
     const tokens = tokenizer.encode(text);
     console.log("Tokens:", tokens);
 
-    const audioPrompt = safetensors.parse(
-      await cachedFetch(predefinedVoices[selectedVoice])
-    ).tensors.audio_prompt;
-    const voiceEmbed = np
-      .array(audioPrompt.data as Float32Array<ArrayBuffer>, {
-        shape: audioPrompt.shape,
+    let voiceEmbed: np.Array;
+
+    if (selectedVoice === "custom" && customVoiceFile) {
+      // Voice cloning: encode custom audio
+      console.log("Processing custom voice file...");
+      const arrayBuffer = await customVoiceFile.arrayBuffer();
+      const { samples, sampleRate } = parseWav(arrayBuffer);
+      console.log(`Loaded WAV: ${samples.length} samples at ${sampleRate}Hz`);
+
+      // Resample to 24kHz if needed
+      const resampled = resampleAudio(samples, sampleRate, SAMPLE_RATE);
+      console.log(`Resampled to ${resampled.length} samples at ${SAMPLE_RATE}Hz`);
+
+      // Create audio tensor [1, T] in float16 to match model precision
+      const audioTensor = np.array(resampled, {
         dtype: np.float32,
-      })
-      .slice(0)
-      .astype(np.float16);
+        shape: [1, resampled.length],
+      }).astype(np.float16);
+
+      // Encode with Mimi encoder -> [512, T']
+      console.log("Encoding audio with Mimi...");
+      const encoded = runMimiEncode(tree.ref(model.mimi), audioTensor);
+      console.log("Encoded shape:", encoded.shape);
+
+      // Transpose to [T', 512]
+      const encodedTransposed = encoded.transpose([1, 0]);
+
+      // Project to conditioning space: [T', 512] @ [512, 1024] -> [T', 1024]
+      voiceEmbed = np.dot(encodedTransposed, model.flowLM.speakerProjWeight.ref.transpose()).astype(np.float16);
+      console.log("Voice embedding shape:", voiceEmbed.shape);
+    } else {
+      // Use predefined voice
+      const audioPrompt = safetensors.parse(
+        await cachedFetch(predefinedVoices[selectedVoice])
+      ).tensors.audio_prompt;
+      voiceEmbed = np
+        .array(audioPrompt.data as Float32Array<ArrayBuffer>, {
+          shape: audioPrompt.shape,
+          dtype: np.float32,
+        })
+        .slice(0)
+        .astype(np.float16);
+    }
 
     const tokensAr = np.array(tokens, { dtype: np.uint32 });
     let embeds = model.flowLM.conditionerEmbed.ref.slice(tokensAr); // [seq_len, 1024]
@@ -249,11 +284,33 @@ export default function TTSPage() {
                   {voice.charAt(0).toLocaleUpperCase() + voice.slice(1)}
                 </option>
               ))}
+              <option value="custom">Custom Voice</option>
             </select>
+
+            {selectedVoice === "custom" && (
+              <>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="audio/wav,.wav"
+                  className="hidden"
+                  onChange={(e) => setCustomVoiceFile(e.target.files?.[0] || null)}
+                />
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  <Upload size={16} />
+                  {customVoiceFile ? customVoiceFile.name.slice(0, 12) : "Upload WAV"}
+                </button>
+              </>
+            )}
+
             <button
               className="btn"
               type="submit"
-              disabled={playing || prompt.trim() === ""}
+              disabled={playing || prompt.trim() === "" || (selectedVoice === "custom" && !customVoiceFile)}
             >
               {playing ? (
                 <AudioLines size={20} className="animate-pulse" />

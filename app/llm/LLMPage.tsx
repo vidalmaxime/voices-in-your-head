@@ -3,7 +3,7 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 import { defaultDevice, init, numpy as np, tree } from "@jax-js/jax";
 import { cachedFetch, safetensors, tokenizers } from "@jax-js/loaders";
-import { Loader2, Mic, MicOff, Volume2, VolumeX } from "lucide-react";
+import { Loader2, Mic, MicOff, Volume2, VolumeX, GitBranch } from "lucide-react";
 import { MicVAD } from "@ricky0123/vad-web";
 
 import DownloadManager, { DownloadManagerHandle } from "../tts/DownloadManager";
@@ -22,6 +22,14 @@ interface WorkerResponse {
   progress?: number;
   loaded?: number;
   total?: number;
+  branchId?: number;
+  branchComplete?: boolean;
+}
+
+interface Branch {
+  id: number;
+  text: string;
+  complete: boolean;
 }
 
 interface ProgressItem {
@@ -137,6 +145,13 @@ export default function LLMPage() {
   const selectedVoiceRef = useRef(selectedVoice);
   const customVoiceFileRef = useRef(customVoiceFile);
 
+  // Branch mode state
+  const [branchMode, setBranchMode] = useState(false);
+  const [branches, setBranches] = useState<Branch[]>([]);
+  const [speakingBranchId, setSpeakingBranchId] = useState<number | null>(null);
+  const branchModeRef = useRef(branchMode);
+  const branchTokenBuffersRef = useRef<Record<number, string>>({});
+
   // Keep refs in sync
   useEffect(() => {
     selectedVoiceRef.current = selectedVoice;
@@ -144,6 +159,9 @@ export default function LLMPage() {
   useEffect(() => {
     customVoiceFileRef.current = customVoiceFile;
   }, [customVoiceFile]);
+  useEffect(() => {
+    branchModeRef.current = branchMode;
+  }, [branchMode]);
 
   // VAD state
   const vadRef = useRef<MicVAD | null>(null);
@@ -299,6 +317,18 @@ export default function LLMPage() {
     }
   }
 
+  async function speakBranch(branchId: number) {
+    const branch = branches.find(b => b.id === branchId);
+    if (!branch || !branch.text.trim()) return;
+
+    setSpeakingBranchId(branchId);
+    try {
+      await speakText(branch.text);
+    } finally {
+      setSpeakingBranchId(null);
+    }
+  }
+
   const interruptCompletion = useCallback(() => {
     if (isCompletingRef.current) {
       console.log("Interrupting completion");
@@ -308,6 +338,10 @@ export default function LLMPage() {
       isCompletingRef.current = false;
       setCompletionText(null);
       tokenBufferRef.current = "";
+      // Clear branches in branch mode
+      setBranches([]);
+      branchTokenBuffersRef.current = {};
+      setSpeakingBranchId(null);
     }
   }, []);
 
@@ -335,7 +369,14 @@ export default function LLMPage() {
     tokenBufferRef.current = "";
     completionAbortControllerRef.current = new AbortController();
 
-    console.log("Triggering thought completion with", totalLength, "audio samples");
+    // Reset branch state when starting new completion
+    if (branchModeRef.current) {
+      setBranches([]);
+      branchTokenBuffersRef.current = {};
+      setSpeakingBranchId(null);
+    }
+
+    console.log("Triggering thought completion with", totalLength, "audio samples", branchModeRef.current ? "(branch mode)" : "(linear mode)");
 
     whisperWorkerRef.current.postMessage({
       type: "generatePartial",
@@ -387,15 +428,30 @@ export default function LLMPage() {
         case "partialComplete":
           if (e.data.output && typeof e.data.output === "string" && isCompletingRef.current) {
             let partialText = e.data.output.trim();
+            // Skip blank audio detection
+            if (partialText === "[BLANK_AUDIO]") {
+              isCompletingRef.current = false;
+              break;
+            }
             // Remove trailing punctuation so completion flows naturally
             partialText = partialText.replace(/[.!?,;:]+$/, "");
             if (partialText) {
               console.log("Partial transcription:", partialText);
               setTranscribedText(partialText);
-              workerRef.current?.postMessage({
-                type: "generateCompletion",
-                data: { partialText },
-              });
+
+              if (branchModeRef.current) {
+                // Branch mode: generate multiple completions
+                workerRef.current?.postMessage({
+                  type: "generateBranches",
+                  data: { partialText, numBranches: 3 },
+                });
+              } else {
+                // Linear mode: single completion
+                workerRef.current?.postMessage({
+                  type: "generateCompletion",
+                  data: { partialText },
+                });
+              }
             } else {
               isCompletingRef.current = false;
             }
@@ -540,22 +596,73 @@ export default function LLMPage() {
           break;
         case "update":
           if (isCompletingRef.current && e.data.output) {
-            tokenBufferRef.current += e.data.output;
-            setCompletionText(tokenBufferRef.current);
+            if (branchModeRef.current && e.data.branchId !== undefined) {
+              // Branch mode: accumulate to specific branch
+              const branchId = e.data.branchId;
+              branchTokenBuffersRef.current[branchId] =
+                (branchTokenBuffersRef.current[branchId] || "") + e.data.output;
+
+              setBranches(prev => {
+                const existing = prev.find(b => b.id === branchId);
+                if (existing) {
+                  return prev.map(b =>
+                    b.id === branchId
+                      ? { ...b, text: branchTokenBuffersRef.current[branchId] }
+                      : b
+                  );
+                } else {
+                  return [...prev, { id: branchId, text: branchTokenBuffersRef.current[branchId], complete: false }];
+                }
+              });
+            } else {
+              // Linear mode
+              tokenBufferRef.current += e.data.output;
+              setCompletionText(tokenBufferRef.current);
+            }
+          }
+          break;
+        case "branchComplete":
+          if (isCompletingRef.current && e.data.branchId !== undefined) {
+            const branchId = e.data.branchId;
+            const branchText = branchTokenBuffersRef.current[branchId]?.trim() || "";
+            console.log(`Branch ${branchId} complete:`, branchText);
+
+            // Mark branch as complete
+            setBranches(prev =>
+              prev.map(b =>
+                b.id === branchId ? { ...b, complete: true } : b
+              )
+            );
+
+            // Trigger TTS immediately for this branch
+            if (branchText && !completionAbortControllerRef.current?.signal.aborted) {
+              setSpeakingBranchId(branchId);
+              speakText(branchText, completionAbortControllerRef.current?.signal).finally(() => {
+                setSpeakingBranchId(prev => prev === branchId ? null : prev);
+              });
+            }
           }
           break;
         case "complete":
           if (isCompletingRef.current) {
-            const completionResult = tokenBufferRef.current.trim();
-            console.log("Completion finished:", completionResult);
+            if (branchModeRef.current) {
+              // Branch mode complete - all branches done
+              console.log("All branches complete");
+              isCompletingRef.current = false;
+              branchTokenBuffersRef.current = {};
+            } else {
+              // Linear mode complete
+              const completionResult = tokenBufferRef.current.trim();
+              console.log("Completion finished:", completionResult);
 
-            if (completionResult && !completionAbortControllerRef.current?.signal.aborted) {
-              const signal = completionAbortControllerRef.current?.signal;
-              speakText(completionResult, signal);
+              if (completionResult && !completionAbortControllerRef.current?.signal.aborted) {
+                const signal = completionAbortControllerRef.current?.signal;
+                speakText(completionResult, signal);
+              }
+
+              isCompletingRef.current = false;
+              tokenBufferRef.current = "";
             }
-
-            isCompletingRef.current = false;
-            tokenBufferRef.current = "";
           }
           break;
       }
@@ -651,20 +758,41 @@ export default function LLMPage() {
                   </div>
                 )}
 
-                {(transcribedText || completionText) && (
+                {transcribedText && (
                   <p className="text-2xl leading-relaxed">
                     <span className="text-zinc-300">{transcribedText}</span>
-                    {completionText && (
+                    {!branchMode && completionText && (
                       <span className="text-zinc-500 italic"> {completionText}</span>
                     )}
                   </p>
                 )}
 
-                {isSpeaking && (
-                  <div className="mt-4 flex items-center justify-center gap-2 text-zinc-600 text-xs">
-                    <Volume2 className="w-3 h-3 animate-pulse" />
+                {/* Branch mode display */}
+                {branchMode && branches.length > 0 && (
+                  <div className="flex flex-col gap-3 mt-4">
+                    {branches.map((branch) => (
+                      <div
+                        key={branch.id}
+                        className={`p-3 rounded-lg border cursor-pointer transition-colors ${
+                          speakingBranchId === branch.id
+                            ? 'border-zinc-500 bg-zinc-900'
+                            : 'border-zinc-800 hover:border-zinc-700'
+                        }`}
+                        onClick={() => speakBranch(branch.id)}
+                      >
+                        <span className="text-zinc-500 italic">{branch.text}</span>
+                        {!branch.complete && <span className="animate-pulse ml-1">...</span>}
+                        {speakingBranchId === branch.id && (
+                          <Volume2 className="inline-block w-3 h-3 ml-2 animate-pulse text-zinc-400" />
+                        )}
+                      </div>
+                    ))}
                   </div>
                 )}
+
+                <div className={`mt-4 flex items-center justify-center gap-2 text-zinc-600 text-xs ${isSpeaking && !branchMode ? 'opacity-100' : 'opacity-0'}`}>
+                  <Volume2 className="w-3 h-3 animate-pulse" />
+                </div>
               </div>
             </div>
 
@@ -734,6 +862,17 @@ export default function LLMPage() {
                   }`}
                 >
                   {ttsEnabled ? <Volume2 className="w-4 h-4" /> : <VolumeX className="w-4 h-4" />}
+                </button>
+
+                {/* Branch mode toggle */}
+                <button
+                  onClick={() => setBranchMode(!branchMode)}
+                  className={`p-2 rounded transition-colors ${
+                    branchMode ? "text-zinc-400" : "text-zinc-700"
+                  }`}
+                  title={branchMode ? "Branch mode: ON" : "Branch mode: OFF"}
+                >
+                  <GitBranch className="w-4 h-4" />
                 </button>
               </div>
             </div>

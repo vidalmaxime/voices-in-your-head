@@ -6,16 +6,17 @@ import {
 } from "@huggingface/transformers";
 
 export interface WorkerMessage {
-  type: "check" | "load" | "generate" | "generateCompletion" | "interrupt" | "reset";
+  type: "check" | "load" | "generate" | "generateCompletion" | "generateBranches" | "interrupt" | "reset";
   data?: {
     messages: Array<{ role: string; content: string }>;
     reasonEnabled?: boolean;
     partialText?: string;
+    numBranches?: number;
   };
 }
 
 export interface WorkerResponse {
-  status: "error" | "loading" | "initiate" | "progress" | "done" | "ready" | "start" | "update" | "complete";
+  status: "error" | "loading" | "initiate" | "progress" | "done" | "ready" | "start" | "update" | "complete" | "branchComplete";
   data?: string;
   output?: string;
   tps?: number;
@@ -24,6 +25,8 @@ export interface WorkerResponse {
   file?: string;
   progress?: number;
   total?: number;
+  branchId?: number;
+  branchComplete?: boolean;
 }
 
 declare const navigator: Navigator & { gpu?: { requestAdapter(): Promise<unknown> } };
@@ -228,6 +231,98 @@ async function generateCompletion({ partialText }: { partialText: string }) {
   });
 }
 
+async function generateBranches({ partialText, numBranches = 3 }: { partialText: string; numBranches?: number }) {
+  const [tokenizer, model] = await TextGenerationPipeline.getInstance();
+
+  const systemPrompt = `Finish the sentence. Rules:
+- Output ONLY the rest of the sentence, never repeat the input
+- Be specific to context, not generic, be creative and interesting
+- Minimum 10 words
+- No punctuation at start`;
+
+  const messages = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: partialText },
+  ];
+
+  const inputs = tokenizer.apply_chat_template(messages, {
+    add_generation_prompt: true,
+    return_dict: true,
+    enable_thinking: false,
+  } as Record<string, unknown>);
+
+  self.postMessage({ status: "start" });
+
+  for (let branchId = 0; branchId < numBranches; branchId++) {
+    // Increase temperature for each branch for variety
+    const baseTemperature = 0.5;
+    const temperature = baseTemperature + (branchId * 0.15);
+
+    let startTime: number | null = null;
+    let numTokens = 0;
+    let tps = 0;
+
+    const token_callback_function = () => {
+      startTime ??= performance.now();
+      if (numTokens++ > 0) {
+        tps = (numTokens / (performance.now() - startTime)) * 1000;
+      }
+    };
+
+    const callback_function = (output: string) => {
+      self.postMessage({
+        status: "update",
+        output,
+        tps,
+        numTokens,
+        state: "answering",
+        branchId,
+      });
+    };
+
+    const streamer = new TextStreamer(tokenizer, {
+      skip_prompt: true,
+      skip_special_tokens: true,
+      callback_function,
+      token_callback_function,
+    });
+
+    const generateOptions = {
+      ...(inputs as Record<string, unknown>),
+      do_sample: true,
+      top_k: 10 + (branchId * 5), // Also vary top_k for diversity
+      temperature,
+      max_new_tokens: 50,
+      streamer,
+      stopping_criteria,
+      return_dict_in_generate: true,
+    };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const result = await model.generate(generateOptions) as any;
+
+    const decoded = tokenizer.batch_decode(result.sequences, {
+      skip_special_tokens: true,
+    }) as string[];
+
+    // Signal this branch is complete (triggers TTS immediately)
+    self.postMessage({
+      status: "branchComplete",
+      output: decoded[0],
+      branchId,
+      branchComplete: true,
+    });
+
+    // Reset stopping criteria for next branch
+    stopping_criteria.reset();
+  }
+
+  // Signal all branches are done
+  self.postMessage({
+    status: "complete",
+  });
+}
+
 async function load() {
   self.postMessage({
     status: "loading",
@@ -271,6 +366,13 @@ self.addEventListener("message", async (e: MessageEvent<WorkerMessage>) => {
       stopping_criteria.reset();
       if (data?.partialText) {
         generateCompletion({ partialText: data.partialText });
+      }
+      break;
+
+    case "generateBranches":
+      stopping_criteria.reset();
+      if (data?.partialText) {
+        generateBranches({ partialText: data.partialText, numBranches: data.numBranches });
       }
       break;
 

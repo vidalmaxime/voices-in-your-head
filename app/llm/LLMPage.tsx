@@ -3,7 +3,7 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 import { defaultDevice, init, numpy as np, tree } from "@jax-js/jax";
 import { cachedFetch, safetensors, tokenizers } from "@jax-js/loaders";
-import { Loader2, Mic, MicOff, Volume2, VolumeX, GitBranch } from "lucide-react";
+import { Loader2, Mic, MicOff, Volume2, VolumeX, GitBranch, RotateCcw } from "lucide-react";
 import { MicVAD } from "@ricky0123/vad-web";
 
 import DownloadManager, { DownloadManagerHandle } from "../tts/DownloadManager";
@@ -348,6 +348,31 @@ export default function LLMPage() {
   useEffect(() => {
     interruptCompletionRef.current = interruptCompletion;
   }, [interruptCompletion]);
+
+  const resetAll = useCallback(() => {
+    console.log("Resetting all");
+    // Stop any ongoing completion
+    workerRef.current?.postMessage({ type: "interrupt" });
+    completionAbortControllerRef.current?.abort();
+    currentPlayerRef.current?.abort();
+    isCompletingRef.current = false;
+
+    // Clear all text
+    setTranscribedText(null);
+    setCompletionText(null);
+    tokenBufferRef.current = "";
+
+    // Clear branches
+    setBranches([]);
+    branchTokenBuffersRef.current = {};
+    setSpeakingBranchId(null);
+
+    // Clear audio buffer
+    audioBufferRef.current = [];
+    pauseFrameCountRef.current = 0;
+    speechStartTimeRef.current = null;
+    lastSpeechTimeRef.current = null;
+  }, []);
 
   const triggerThoughtCompletion = useCallback(async () => {
     if (isCompletingRef.current || !whisperWorkerRef.current) return;
@@ -758,35 +783,57 @@ export default function LLMPage() {
                   </div>
                 )}
 
-                {transcribedText && (
+                {transcribedText && !branchMode && (
                   <p className="text-2xl leading-relaxed">
                     <span className="text-zinc-300">{transcribedText}</span>
-                    {!branchMode && completionText && (
+                    {completionText && (
                       <span className="text-zinc-500 italic"> {completionText}</span>
                     )}
                   </p>
                 )}
 
                 {/* Branch mode display */}
-                {branchMode && branches.length > 0 && (
-                  <div className="flex flex-col gap-3 mt-4">
-                    {branches.map((branch) => (
-                      <div
-                        key={branch.id}
-                        className={`p-3 rounded-lg border cursor-pointer transition-colors ${
-                          speakingBranchId === branch.id
-                            ? 'border-zinc-500 bg-zinc-900'
-                            : 'border-zinc-800 hover:border-zinc-700'
-                        }`}
-                        onClick={() => speakBranch(branch.id)}
-                      >
-                        <span className="text-zinc-500 italic">{branch.text}</span>
-                        {!branch.complete && <span className="animate-pulse ml-1">...</span>}
-                        {speakingBranchId === branch.id && (
-                          <Volume2 className="inline-block w-3 h-3 ml-2 animate-pulse text-zinc-400" />
-                        )}
+                {branchMode && transcribedText && (
+                  <div className="text-left">
+                    <p className="text-2xl text-zinc-300 leading-relaxed mb-4">{transcribedText}</p>
+                    {branches.length > 0 && (
+                      <div className="flex flex-col gap-1 pl-4">
+                        {branches.map((branch, index) => {
+                          const curve = branches.length === 1 ? 0 : index === 0 ? -8 : index === branches.length - 1 ? 8 : 0;
+                          return (
+                            <div
+                              key={branch.id}
+                              className="flex items-center cursor-pointer group"
+                              onClick={() => speakBranch(branch.id)}
+                            >
+                              <svg width="28" height="20" viewBox="0 0 28 20" className="shrink-0 mr-1">
+                                <path
+                                  d={`M0,10 Q10,10 14,${10 + curve * 0.5} T28,${10 + curve}`}
+                                  fill="none"
+                                  stroke={speakingBranchId === branch.id ? "#71717a" : "#3f3f46"}
+                                  strokeWidth="1.5"
+                                  strokeLinecap="round"
+                                  className="transition-colors group-hover:stroke-zinc-500"
+                                />
+                              </svg>
+                              <span
+                                className={`text-2xl italic transition-colors ${
+                                  speakingBranchId === branch.id
+                                    ? 'text-zinc-400'
+                                    : 'text-zinc-500 group-hover:text-zinc-400'
+                                }`}
+                              >
+                                {branch.text}
+                                {!branch.complete && <span className="animate-pulse">...</span>}
+                                {speakingBranchId === branch.id && (
+                                  <Volume2 className="inline-block w-4 h-4 ml-2 animate-pulse" />
+                                )}
+                              </span>
+                            </div>
+                          );
+                        })}
                       </div>
-                    ))}
+                    )}
                   </div>
                 )}
 
@@ -873,6 +920,15 @@ export default function LLMPage() {
                   title={branchMode ? "Branch mode: ON" : "Branch mode: OFF"}
                 >
                   <GitBranch className="w-4 h-4" />
+                </button>
+
+                {/* Reset button */}
+                <button
+                  onClick={resetAll}
+                  className="p-2 rounded transition-colors text-zinc-700 hover:text-zinc-400"
+                  title="Reset"
+                >
+                  <RotateCcw className="w-4 h-4" />
                 </button>
               </div>
             </div>

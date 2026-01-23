@@ -48,7 +48,7 @@ type AnyModel = any;
 type AnyTokenizer = any;
 
 class TextGenerationPipeline {
-  static model_id = "onnx-community/Qwen3-0.6B-ONNX"; //"onnx-community/granite-4.0-350m-ONNX";
+  static model_id =  "onnx-community/granite-4.0-1b-ONNX";//"onnx-community/granite-4.0-350m-ONNX"; try fp16 or "onnx-community/granite-4.0-1b-ONNX" with q4; or onnx-community/granite-4.0-micro-ONNX-web  q4f16? (too much ram)
   static tokenizer: Promise<AnyTokenizer> | null = null;
   static model: Promise<AnyModel> | null = null;
 
@@ -58,7 +58,7 @@ class TextGenerationPipeline {
     });
 
     this.model ??= AutoModelForCausalLM.from_pretrained(this.model_id, {
-      dtype: "q4f16",
+      dtype: "q4",
       device: "webgpu",
       progress_callback,
     } as Record<string, unknown>);
@@ -131,7 +131,7 @@ async function generate({ messages, reasonEnabled }: { messages: Array<{ role: s
     do_sample: true,
     top_k: 20,
     temperature: reasonEnabled ? 0.6 : 0.7,
-    max_new_tokens: 16384,
+    max_new_tokens: 500,
     streamer,
     stopping_criteria,
     return_dict_in_generate: true,
@@ -140,7 +140,9 @@ async function generate({ messages, reasonEnabled }: { messages: Array<{ role: s
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const result = await model.generate(generateOptions) as any;
 
-  past_key_values_cache = result.past_key_values;
+  // Clear KV cache after generation to prevent unbounded memory growth
+  // The cache is only useful for multi-turn within a single generate call
+  past_key_values_cache = null;
 
   const decoded = tokenizer.batch_decode(result.sequences, {
     skip_special_tokens: true,
@@ -156,9 +158,9 @@ async function generateCompletion({ partialText }: { partialText: string }) {
   const [tokenizer, model] = await TextGenerationPipeline.getInstance();
 
   const systemPrompt = `Finish the sentence. Rules:
-- Output ONLY the ending words, never repeat the input
-- Be specific to context, not generic
-- 3-8 words maximum
+- Output ONLY the rest of the sentence, never repeat the input
+- Be specific to context, not generic, be creative and interesting
+- Minimum 10 words
 - No punctuation at start`;
 
   const messages = [

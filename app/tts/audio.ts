@@ -245,6 +245,8 @@ export function createStreamingPlayer(): AudioPlayer {
         await lastEndedPromise;
       }
       await audioCtx.close();
+      // Clear chunks to free memory
+      chunks.length = 0;
     },
 
     abort() {
@@ -258,6 +260,8 @@ export function createStreamingPlayer(): AudioPlayer {
         }
       }
       activeSources.length = 0;
+      // Clear chunks to free memory
+      chunks.length = 0;
       nextStartTime = audioCtx.currentTime;
     },
 

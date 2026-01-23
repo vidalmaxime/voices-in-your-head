@@ -36,6 +36,13 @@ let _model: PocketTTS | null = null;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let _tokenizer: any | null = null;
 
+/** Clear TTS model cache to free memory */
+function clearTTSCache() {
+  _weights = null;
+  _model = null;
+  _tokenizer = null;
+}
+
 const HF_URL_PREFIX =
   "https://huggingface.co/kyutai/pocket-tts-without-voice-cloning/resolve/fbf8280";
 
@@ -400,6 +407,8 @@ export default function LLMPage() {
     whisperWorkerRef.current.addEventListener("message", onWhisperMessage);
     return () => {
       whisperWorkerRef.current?.removeEventListener("message", onWhisperMessage);
+      whisperWorkerRef.current?.terminate();
+      whisperWorkerRef.current = null;
     };
   }, []);
 
@@ -555,6 +564,12 @@ export default function LLMPage() {
     workerRef.current.addEventListener("message", onMessageReceived);
     return () => {
       workerRef.current?.removeEventListener("message", onMessageReceived);
+      // Reset KV cache on unmount to free memory
+      workerRef.current?.postMessage({ type: "reset" });
+      workerRef.current?.terminate();
+      workerRef.current = null;
+      // Clear TTS cache
+      clearTTSCache();
     };
   }, []);
 

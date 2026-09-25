@@ -1,0 +1,57 @@
+/* Loading: the voices arrive. The figures stand sunk in the black
+   field and surface one by one as the models come in; the words below say
+   what is being learned, and how much has come. */
+.loading-words {
+  position: absolute;
+  left: 50%;
+  bottom: 9%;
+  transform: translateX(-50%);
+  width: min(60ch, 90%);
+  margin: 0;
+  text-align: center;
+  z-index: 200;
+}
+/* A thin ring above the words, turning as long as the load is alive. */
+.loading-spinner {
+  display: block;
+  width: 22px;
+  height: 22px;
+  margin: 0 auto 14px;
+  border-radius: 50%;
+  border: 1.5px solid rgba(255, 255, 255, 0.2);
+  border-top-color: #fff;
+  animation: loading-spin 900ms linear infinite;
+}
+@keyframes loading-spin {
+  to { transform: rotate(360deg); }
+}
+.loading-words__phase {
+  margin: 0;
+  color: #fff;
+  font-size: 22px;
+  line-height: 1.3;
+  font-style: italic;
+}
+.loading-words__count {
+  margin: 8px 0 0;
+  color: rgba(255, 255, 255, 0.55);
+  font-size: 15px;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+}
+/* The crowd stands above the words: a smaller stage, set higher. */
+.chorus-field .loading-stage {
+  top: 42%;
+  width: min(96cqw, calc(76cqh * 16 / 9));
+}
+/* A hairline along the bottom edge keeps the exact measure. */
+.loading-line {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 1px;
+  background: #fff;
+  opacity: 0.5;
+  transition: width 600ms ease;
+  z-index: 200;
+}

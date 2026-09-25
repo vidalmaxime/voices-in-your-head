@@ -1,0 +1,29 @@
+# mlx_lm.lora config for the thought-completion finetune.
+# Run from the repo root:  mlx_lm.lora -c scripts/finetune/lora-config.yaml
+model: "data/models/lfm2.5-350m-base"
+train: true
+fine_tune_type: "lora"
+# Separate outputs from the earlier SmolLM experiment.
+data: "data/personal-lfm"
+adapter_path: "data/personal-lfm/adapters"
+seed: 7
+mask_prompt: true
+grad_checkpoint: true
+
+# ~2k pairs, batch 4 -> ~500 steps/epoch. Stop short of 2 epochs: the main
+# failure mode is memorizing the notes and reciting them verbatim.
+iters: 800
+batch_size: 4
+learning_rate: 1.0e-4
+steps_per_eval: 100
+val_batches: 24
+save_every: 200
+max_seq_length: 512
+
+# All layers, rank 8. At 350M the adapter is a few MB either way; data quality
+# matters far more than rank.
+num_layers: -1
+lora_parameters:
+  rank: 8
+  dropout: 0.05
+  scale: 20.0

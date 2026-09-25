@@ -1,0 +1,131 @@
+.voices-intro {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 24px;
+  min-height: 100svh;
+  padding: 24px;
+  background: #09090b;
+}
+.intro-composition {
+  width: min(100%, calc((100svh - 160px) * 1.35));
+  flex-shrink: 0;
+}
+.intro-title {
+  width: 100%;
+  margin: 0 auto -21%;
+  position: relative;
+  transform: translateY(-24px);
+  z-index: 1;
+}
+.intro-title img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+.intro-artwork {
+  position: relative;
+  z-index: 2;
+  width: 92%;
+  margin-inline: auto;
+  overflow: hidden;
+  border-radius: 24px;
+}
+.intro-image {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+.intro-echo {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  mask-image: radial-gradient(ellipse var(--echo-width) var(--echo-height) at var(--echo-x) var(--echo-y), #000 35%, transparent 95%);
+  mix-blend-mode: screen;
+  animation: intro-thought 56s ease-in-out infinite both;
+}
+/* Fourteen faces, four seconds apart. Each impression lasts 3.6 seconds,
+   leaving a quiet gap before the next face, including across the loop. */
+@keyframes intro-thought {
+  0%, 6.4%, 100% { opacity: 0; transform: translate(0, 0); }
+  1.7% { opacity: 0.6; transform: translate(2.2%, -0.2%); }
+  3.85% { opacity: 0.45; transform: translate(2.6%, -0.1%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .intro-echo { display: none; animation: none; }
+}
+.intro-controls {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+.intro-action {
+  position: relative;
+}
+.intro-download {
+  position: absolute;
+  left: calc(100% + 12px);
+  top: 50%;
+  transform: translateY(-50%);
+  white-space: nowrap;
+}
+.intro-begin {
+  min-width: 132px;
+  min-height: 48px;
+  padding: 11px 30px;
+  border: 1px solid #fff4d8;
+  border-radius: 999px;
+  background: #f5e6c8;
+  color: #211b14;
+  font-size: 19px;
+  line-height: 1.2;
+  cursor: pointer;
+  box-shadow: 0 3px 18px rgb(245 230 200 / 12%);
+  transition: background 180ms ease, box-shadow 180ms ease, transform 180ms ease;
+}
+.intro-begin:hover {
+  background: #fff2d6;
+  box-shadow: 0 5px 26px rgb(245 230 200 / 23%);
+  transform: translateY(-2px);
+}
+.intro-begin:active {
+  transform: translateY(0);
+  box-shadow: 0 1px 8px rgb(245 230 200 / 12%);
+}
+.intro-begin:focus-visible {
+  outline: 2px solid #f5e6c8;
+  outline-offset: 5px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .intro-begin { transition: none; }
+  .intro-begin:hover { transform: none; }
+}
+.intro-download__trigger {
+  cursor: help;
+  color: #a1a1aa;
+  font: 12px system-ui, sans-serif;
+}
+.intro-download__tooltip {
+  white-space: normal;
+  position: absolute;
+  left: calc(100% + 10px);
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 10;
+  width: min(260px, calc(100vw - 48px));
+  padding: 12px;
+  border: 1px solid #3f3f46;
+  border-radius: 8px;
+  background: #18181b;
+  color: #d4d4d8;
+  font: 12px/1.5 system-ui, sans-serif;
+  text-align: left;
+}
+@media (max-width: 767px) {
+  .voices-intro { padding: 16px; }
+  .intro-artwork { border-radius: 18px; }
+}

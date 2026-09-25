@@ -1,0 +1,42 @@
+{
+  "name": "voices-in-your-head",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "test:completion": "node --test app/llm/staggered-chorus.test.mjs app/llm/conversation-context.test.mjs app/llm/chorus-audio.test.mjs app/llm/completion-logic.test.mjs app/llm/completion-prefix.test.mjs app/llm/completion-queue.test.mjs app/llm/speech-queue.test.mjs",
+    "test:speculation": "node --test app/llm/speculation.test.mjs",
+    "test:loading": "node --test app/llm/model-loading.test.mjs app/llm/loading-layout.test.mjs",
+    "test:runtime-lock": "node --test app/model-runtime-lock.test.mjs",
+    "test:stt": "node --test app/llm/stt-metrics.test.mjs",
+    "test:tts": "node --test app/tts/generation-lifecycle.test.mjs app/tts/voice-reference.test.mjs app/tts/compact-flow-cache.test.mjs",
+    "test:vad": "node --test app/llm/vad-logic.test.mjs app/llm/microphone.test.mjs",
+    "verify:tts-voices": "node scripts/verify-tts-voice-ranges.mjs"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "^2.11.0",
+    "@huggingface/transformers": "4.2.0",
+    "@jax-js/jax": "^0.1.6",
+    "@jax-js/loaders": "^0.1.0",
+    "@ricky0123/vad-react": "^0.0.36",
+    "@vercel/analytics": "^2.0.1",
+    "lucide-react": "^0.562.0",
+    "next": "16.1.4",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "sentencepiece-buf": "^0.2.1-0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.1.4",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}

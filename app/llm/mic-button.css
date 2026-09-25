@@ -1,0 +1,192 @@
+/* At rest the microphone is a black disc with a glyph; under the cursor one
+   of the painted microphones springs up over it from a speck, a different one
+   each time, and while the app listens it stays and the ring breathes. */
+.mic {
+  --ring: rgba(255, 255, 255, 0.35);
+  position: relative;
+  width: 76px;
+  height: 76px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: #000;
+  color: #fff;
+  cursor: pointer;
+  box-shadow: 0 0 0 1px var(--ring), 0 0 0 0 rgba(255, 255, 255, 0);
+  transition: box-shadow 600ms ease, transform 300ms ease;
+  -webkit-tap-highlight-color: transparent;
+}
+.mic:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 4px;
+}
+.mic:disabled {
+  cursor: default;
+}
+.mic__glyph {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  transition: opacity 200ms ease, transform 300ms ease;
+}
+.mic__mouth {
+  position: absolute;
+  left: 50%;
+  bottom: 4px;
+  width: auto;
+  height: 104px;
+  transform-origin: 50% 90%;
+  transform: translateX(-50%) scale(0.1) rotate(-24deg);
+  filter: drop-shadow(0 8px 14px rgba(0, 0, 0, 0.7));
+  opacity: 0;
+  transition: transform 260ms cubic-bezier(0.6, 0, 0.8, 0.4), opacity 200ms ease;
+  pointer-events: none;
+}
+/* The spring: from a speck to the whole disc, overshooting, as the letters
+   on the page do. */
+.mic[data-mouth="true"] .mic__mouth {
+  transform: translateX(-50%) scale(1) rotate(0deg);
+  opacity: 1;
+  transition: transform 460ms cubic-bezier(0.2, 1.45, 0.35, 1), opacity 120ms ease;
+}
+.mic[data-mouth="true"] .mic__glyph {
+  opacity: 0;
+  transform: scale(0.6);
+}
+.mic:hover {
+  --ring: rgba(255, 255, 255, 0.8);
+}
+/* Listening: the ring is solid white, a red point marks it live, and rings
+   of sound spread out from it. */
+.mic[data-listening="true"] {
+  --ring: rgba(255, 255, 255, 0.95);
+  box-shadow: 0 0 0 2px var(--ring), 0 0 0 0 rgba(255, 255, 255, 0);
+}
+.mic__ripple {
+  position: absolute;
+  inset: -2px;
+  border-radius: 50%;
+  border: 1.5px solid rgba(255, 255, 255, 0.7);
+  opacity: 0;
+  pointer-events: none;
+}
+.mic[data-listening="true"] .mic__ripple {
+  animation: mic-ripple 2.6s ease-out infinite;
+}
+.mic[data-listening="true"] .mic__ripple + .mic__ripple {
+  animation-delay: 1.3s;
+}
+@keyframes mic-ripple {
+  0% { transform: scale(1); opacity: 0.7; }
+  100% { transform: scale(1.9); opacity: 0; }
+}
+.mic__live {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #e2604f;
+  box-shadow: 0 0 0 2px #000;
+  opacity: 0;
+  transform: scale(0.4);
+  transition: opacity 240ms ease, transform 240ms ease;
+}
+.mic[data-listening="true"] .mic__live {
+  opacity: 1;
+  transform: scale(1);
+  animation: mic-live 1.6s ease-in-out infinite;
+}
+@keyframes mic-live {
+  0%, 100% { box-shadow: 0 0 0 2px #000, 0 0 0 0 rgba(226, 96, 80, 0.6); }
+  60% { box-shadow: 0 0 0 2px #000, 0 0 0 6px rgba(226, 96, 80, 0); }
+}
+/* Hovering a live microphone offers the stop: the painting dims behind a
+   square. */
+.mic__stop {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  opacity: 0;
+  transform: scale(0.6);
+  transition: opacity 180ms ease, transform 180ms ease;
+  pointer-events: none;
+}
+.mic[data-stop="true"] .mic__stop {
+  opacity: 1;
+  transform: scale(1);
+}
+.mic[data-stop="true"] .mic__mouth {
+  opacity: 0.25;
+  filter: drop-shadow(0 8px 14px rgba(0, 0, 0, 0.7)) saturate(0.4);
+}
+/* The speaker is talking: the mouth leans in, the ring warms, the rings of
+   sound come faster. */
+.mic[data-speaking="true"] {
+  --ring: rgba(226, 96, 80, 0.9);
+  box-shadow: 0 0 0 2px var(--ring), 0 0 28px 4px rgba(226, 96, 80, 0.35);
+}
+.mic[data-speaking="true"] .mic__ripple {
+  border-color: rgba(226, 96, 80, 0.8);
+  animation-duration: 1.2s;
+}
+.mic[data-speaking="true"] .mic__ripple + .mic__ripple {
+  animation-delay: 0.6s;
+}
+.mic[data-speaking="true"] .mic__mouth {
+  transform: translateX(-50%) scale(1.06) rotate(0deg);
+}
+
+/* Reset sits beside the mouth, small. */
+.mic-reset {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.4);
+  cursor: pointer;
+  transition: color 200ms ease, background 200ms ease;
+}
+.mic-reset:hover {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.08);
+}
+.mic-reset:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 2px;
+}
+
+/* The voices are being made or are speaking: the microphone goes grey and
+   still, and no sound rings out of it. */
+.mic[data-busy="true"],
+.mic[data-busy="true"]:hover {
+  --ring: rgba(255, 255, 255, 0.22);
+  box-shadow: 0 0 0 2px var(--ring);
+  cursor: default;
+}
+.mic[data-busy="true"] .mic__mouth,
+.mic[data-busy="true"]:hover .mic__mouth,
+.mic[data-busy="true"] .mic__glyph {
+  filter: grayscale(1) brightness(0.55);
+  transition: filter 1ms;
+}
+.mic[data-busy="true"] .mic__ripple {
+  animation: none;
+  opacity: 0;
+}
+.mic[data-busy="true"] .mic__live {
+  background: #6b6b6b;
+  animation: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mic, .mic__mouth, .mic__glyph { transition-duration: 1ms; animation: none; }
+  .mic__ripple, .mic[data-listening="true"] .mic__live { animation: none; }
+}

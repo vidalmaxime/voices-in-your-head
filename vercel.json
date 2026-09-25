@@ -1,0 +1,9 @@
+{
+  "redirects": [
+    {
+      "source": "/",
+      "destination": "https://maximevidal.com/voices",
+      "permanent": true
+    }
+  ]
+}

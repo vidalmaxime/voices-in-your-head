@@ -1,0 +1,179 @@
+/* The Chorus: painted figures surface out of black, speak, and sink back.
+   Nothing else moves. The one gesture is the crossing of the threshold, from
+   grey into colour on the way up and back into the dark on the way down; the
+   sinking is slower than the rising. */
+.chorus-field {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  background: #000;
+  color: #fff;
+  user-select: none;
+  overflow: hidden;
+  container-type: size;
+}
+/* The stage is a 16:9 box centred in the field, so every position and size,
+   set in percent, means the same thing whatever the window's shape. */
+.chorus-stage {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: min(100cqw, calc(100cqh * 16 / 9));
+  aspect-ratio: 16 / 9;
+  transform: translate(-50%, -50%);
+}
+
+/* Everything but the subtitle: it creeps closer, barely, for as long as
+   voices are sounding, and eases back once the field is quiet. */
+.chorus-scene {
+  position: absolute;
+  inset: 0;
+  transform-origin: 50% 62%;
+  transform: scale(1);
+  transition: transform 6s cubic-bezier(0.4, 0, 0.6, 1);
+}
+.chorus-scene[data-live="true"] {
+  transform: scale(1.06);
+  transition: transform 28s linear;
+}
+
+/* The speaker's own words, small, as a subtitle in an installation. */
+.chorus-transcript {
+  position: absolute;
+  left: 50%;
+  bottom: 6%;
+  transform: translateX(-50%);
+  max-width: min(60ch, 90%);
+  margin: 0;
+  text-align: center;
+  color: #fff;
+  font-size: 16px;
+  line-height: 1.5;
+  z-index: 200;
+}
+
+.chorus-transcript[data-placeholder="true"] {
+  color: rgba(255, 255, 255, 0.55);
+}
+
+/* A slot is anchored by its bottom-center at the waterline and sized by
+   width, so figures never meet. The far row is smaller and dimmer, so voices
+   sit at different distances. */
+.chorus-slot {
+  position: absolute;
+  transform: translate(-50%, -100%);
+  pointer-events: none;
+}
+.chorus-figure {
+  position: relative;
+  width: 100%;
+  /* Sunk: below the line, grey, dark. */
+  opacity: 0;
+  filter: brightness(0.15) saturate(0) contrast(1.15);
+  translate: 0 14%;
+  transition:
+    opacity 3.2s cubic-bezier(0.6, 0, 0.9, 0.6),
+    filter 3.2s cubic-bezier(0.6, 0, 0.9, 0.6),
+    translate 3.2s cubic-bezier(0.6, 0, 0.9, 0.6);
+}
+.chorus-slot[data-open="true"] .chorus-figure {
+  opacity: 1;
+  filter: brightness(1) saturate(1) contrast(1);
+  translate: 0 0;
+  transition:
+    opacity 0.8s cubic-bezier(0.2, 0.5, 0.3, 1),
+    filter 1.1s cubic-bezier(0.2, 0.5, 0.3, 1),
+    translate 0.8s cubic-bezier(0.2, 0.5, 0.3, 1);
+}
+.chorus-slot[data-depth="mid"][data-open="true"] .chorus-figure {
+  filter: brightness(0.8) saturate(0.85) contrast(1.05);
+}
+.chorus-slot[data-depth="far"][data-open="true"] .chorus-figure {
+  filter: brightness(0.62) saturate(0.7) contrast(1.05);
+}
+/* Up but not speaking, before or after its turn: present, a shade withdrawn. */
+.chorus-slot[data-open="true"][data-speaking="false"] .chorus-figure {
+  filter: brightness(0.72) saturate(0.8) contrast(1.05);
+  transition-duration: 1.6s;
+}
+.chorus-slot[data-depth="mid"][data-open="true"][data-speaking="false"] .chorus-figure {
+  filter: brightness(0.58) saturate(0.7) contrast(1.05);
+}
+.chorus-slot[data-depth="far"][data-open="true"][data-speaking="false"] .chorus-figure {
+  filter: brightness(0.46) saturate(0.6) contrast(1.05);
+}
+.chorus-figure img {
+  display: block;
+  width: 100%;
+  height: auto;
+  /* The waterline dissolves the figure's base. */
+  -webkit-mask-image: linear-gradient(to top, transparent 0%, #000 38%);
+  mask-image: linear-gradient(to top, transparent 0%, #000 38%);
+}
+.chorus-slot[data-facing="left"] .chorus-figure img {
+  transform: scaleX(-1);
+}
+/* The figure's reflection in the dark water it stands in. The flip carries
+   the mask with it, so it is written for the unflipped image: the base stays,
+   the head dissolves. */
+.chorus-figure img + img {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  opacity: 0.28;
+  filter: blur(1.5px);
+  -webkit-mask-image: linear-gradient(to top, #000 8%, transparent 50%);
+  mask-image: linear-gradient(to top, #000 8%, transparent 50%);
+  transform: scaleY(-1);
+}
+.chorus-slot[data-facing="left"] .chorus-figure img + img {
+  transform: scale(-1, -1);
+}
+
+/* What a voice says, appearing word by word at about the pace of speech, from
+   its mouth. Captions sit above every figure so a neighbour cannot cover them. */
+.chorus-captions {
+  position: absolute;
+  inset: 0;
+  z-index: 100;
+  pointer-events: none;
+}
+.chorus-caption {
+  position: absolute;
+  width: max-content;
+  font-size: 20px;
+  line-height: 1.3;
+  font-style: italic;
+  font-weight: 400;
+  color: #fff;
+}
+.chorus-caption[data-depth="mid"] {
+  font-size: 16px;
+  color: rgba(255, 255, 255, 0.85);
+}
+.chorus-caption[data-depth="far"] {
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.7);
+}
+/* Words arrive one by one; once the voice stops the whole line holds for a
+   moment, then dissolves with the figure. */
+.chorus-caption span {
+  opacity: 0;
+  transition: opacity 2.6s ease 1.4s;
+}
+.chorus-caption[data-open="true"] span {
+  opacity: 1;
+  transition: opacity 0.5s ease;
+  transition-delay: var(--word-delay, 0s);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chorus-figure, .chorus-slot[data-open="true"] .chorus-figure, .chorus-caption span {
+    transition-duration: 1ms;
+    transition-delay: 0s;
+  }
+  .chorus-scene, .chorus-scene[data-live="true"] {
+    transform: none;
+    transition: none;
+  }
+}

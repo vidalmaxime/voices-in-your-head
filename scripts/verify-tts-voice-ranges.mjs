@@ -1,35 +1,8 @@
-import { readFile } from "node:fs/promises";
+import { pocketModelUrls } from "../app/tts/model-assets.ts";
 
-const WORKER_PATH = new URL("../public/tts-onnx/inference-worker.js", import.meta.url);
-const BASE_URL =
-  "https://huggingface.co/spaces/KevinAHM/pocket-tts-web/resolve/main/onnx/english_2026-04";
-const BUNDLE_URL = `${BASE_URL}/bundle.json`;
-const VOICES_URL = `${BASE_URL}/voices.bin`;
-
-function parseRanges(workerSource) {
-  const tableMatch = workerSource.match(
-    /const PREDEFINED_VOICE_RANGES = \{([\s\S]*?)\n\};/,
-  );
-  if (!tableMatch) {
-    throw new Error("Could not find PREDEFINED_VOICE_RANGES in inference worker");
-  }
-
-  const ranges = {};
-  const entryRegex = /(\w+): \{ start: (\d+), end: (\d+) \}/g;
-  let match = entryRegex.exec(tableMatch[1]);
-  while (match) {
-    ranges[match[1]] = {
-      start: Number(match[2]),
-      end: Number(match[3]),
-    };
-    match = entryRegex.exec(tableMatch[1]);
-  }
-
-  if (Object.keys(ranges).length === 0) {
-    throw new Error("No preset voice ranges were parsed");
-  }
-  return ranges;
-}
+// Checks that bundle.json's preset voice byte ranges slice voices.bin into
+// whole PTVB records holding every flow-LM state tensor.
+const { bundle: BUNDLE_URL, voices: VOICES_URL } = pocketModelUrls();
 
 function readUint16(view, cursor) {
   const value = view.getUint16(cursor.offset, true);
@@ -116,9 +89,8 @@ async function fetchVoiceSlice(name, range) {
   return buffer;
 }
 
-const workerSource = await readFile(WORKER_PATH, "utf8");
-const ranges = parseRanges(workerSource);
 const manifest = await fetchJson(BUNDLE_URL);
+const ranges = manifest.voices ?? {};
 const manifestVoices = manifest.predefined_voices;
 if (!Array.isArray(manifestVoices)) {
   throw new Error("bundle.json did not contain predefined_voices");
@@ -140,13 +112,18 @@ if (!ranges[voiceName]) {
   throw new Error(`Unknown voice '${voiceName}'. Known: ${rangeNames.join(", ")}`);
 }
 
+const stateNames = manifest.graphs.flow_lm_main.states.map((spec) => spec.name);
 const slice = await fetchVoiceSlice(voiceName, ranges[voiceName]);
 const parsed = parsePtvbVoiceSlice(slice);
 if (parsed.name !== voiceName) {
   throw new Error(`Range for ${voiceName} parsed as ${parsed.name}`);
 }
-if (parsed.tensorCount !== 12) {
-  throw new Error(`Expected 12 tensors for ${voiceName}, got ${parsed.tensorCount}`);
+const tensorNames = parsed.tensors.map((tensor) => tensor.path);
+const absent = stateNames.filter((name) => !tensorNames.includes(name));
+if (absent.length > 0 || parsed.tensorCount !== stateNames.length) {
+  throw new Error(
+    `Expected ${stateNames.length} flow state tensors for ${voiceName}, got ${parsed.tensorCount} (missing: ${absent.join(", ") || "none"})`,
+  );
 }
 if (!parsed.tensors.every((tensor) => tensor.shape.length > 0 && tensor.byteLength > 0)) {
   throw new Error(`Parsed ${voiceName} contained an invalid tensor`);

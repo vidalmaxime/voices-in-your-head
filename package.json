@@ -12,7 +12,7 @@
     "test:loading": "node --test app/llm/model-loading.test.mjs app/llm/loading-layout.test.mjs",
     "test:runtime-lock": "node --test app/model-runtime-lock.test.mjs",
     "test:stt": "node --test app/llm/stt-metrics.test.mjs",
-    "test:tts": "node --test app/tts/generation-lifecycle.test.mjs app/tts/voice-reference.test.mjs app/tts/compact-flow-cache.test.mjs",
+    "test:tts": "node --test app/tts/generation-lifecycle.test.mjs app/tts/voice-reference.test.mjs",
     "test:vad": "node --test app/llm/vad-logic.test.mjs app/llm/microphone.test.mjs",
     "verify:tts-voices": "node scripts/verify-tts-voice-ranges.mjs"
   },

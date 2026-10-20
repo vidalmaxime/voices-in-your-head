@@ -1,0 +1,6 @@
+# Python >= 3.10. Pinned to the kyutai commit that added the small English models.
+pocket-tts @ git+https://github.com/kyutai-labs/pocket-tts@da629e6
+onnx>=1.17
+onnxruntime>=1.20
+onnxscript
+soundfile

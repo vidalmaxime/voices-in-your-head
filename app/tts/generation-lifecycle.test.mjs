@@ -84,7 +84,7 @@ test("a failed track rejects its request", async () => {
 });
 
 const workerSource = await readFile(new URL("../../public/tts-onnx/inference-worker.js", import.meta.url), "utf8");
-const workerFunction = workerSource.slice(workerSource.indexOf("async function startGeneration("), workerSource.indexOf("function setFlowCacheFrames"));
+const workerFunction = workerSource.slice(workerSource.indexOf("async function startGeneration("), workerSource.indexOf("function maxGenerationFrames"));
 for (const outcome of ["success", "cancel", "error"]) {
   test(`worker acknowledges ${outcome} only after the generation pipeline exits`, async () => {
     const events = [];

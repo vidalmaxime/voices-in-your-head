@@ -4,6 +4,7 @@ import "./chorus-stage.css";
 import "./loading-screen.css";
 import { assetUrl } from "../base-path";
 import { CHARACTER_ASPECTS, CHARACTER_COUNT, chorusFont } from "./ChorusStage";
+import { FIRST_LOAD_BYTES, TTS_FIRST_LOAD_BYTES } from "./first-load";
 import { loadingLayout } from "./loading-layout";
 
 export interface LoadProgressItem {
@@ -25,8 +26,8 @@ export interface LoadingScreenProps {
 }
 
 /** What a first load fetches, so the measure reads right before every file has announced itself. */
-const EXPECTED_BYTES = 1_058e6;
-const TTS_BYTES = 126e6;
+const EXPECTED_BYTES = FIRST_LOAD_BYTES;
+const TTS_BYTES = TTS_FIRST_LOAD_BYTES;
 /** The crowd's arrangement is the same every load: a place people come to know. */
 const LOADING_CAST = loadingLayout(CHARACTER_ASPECTS);
 

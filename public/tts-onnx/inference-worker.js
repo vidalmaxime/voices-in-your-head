@@ -1,5 +1,3 @@
-import { compactFlowModel, requiredFlowCapacity } from './compact-flow-cache.js';
-
 // Pocket TTS ONNX Web Worker
 console.log('Pocket TTS Worker Starting...');
 self.postMessage({ type: 'status', status: 'Worker Thread Started', state: 'idle' });
@@ -7,26 +5,25 @@ self.postMessage({ type: 'status', status: 'Worker Thread Started', state: 'idle
 // Load ONNX Runtime (will be loaded dynamically in loadModels for module worker)
 let ort = null;
 let streamChunkFrames = 4;
-let compactFlowEnabled = true;
-let flowSessionOptions = null;
 
 // Configuration
 let MODELS = {
     mimi_encoder: './onnx/mimi_encoder.onnx',
     text_conditioner: './onnx/text_conditioner.onnx',
     flow_lm_main: './onnx/flow_lm_main_int8.onnx',
-    flow_lm_flow: './onnx/flow_lm_flow_int8.onnx',
-    mimi_decoder: './onnx/mimi_decoder_int8.onnx',
+    flow_lm_flow: './onnx/flow_lm_flow.onnx',
+    mimi_decoder: './onnx/mimi_decoder.onnx',
     tokenizer: './tokenizer.model',
     bundle: './bundle.json',
     bos_before_voice: './bos_before_voice.npy',
     voices: './voices.bin'
 };
 
-const SAMPLE_RATE = 24000;
-const SAMPLES_PER_FRAME = 1920;
-const MAX_FRAMES = 240;
-let STATE_CACHE_FRAMES = 1000;
+// Model shape, sampling settings, state layouts and preset voice byte ranges
+// all come from the export's bundle.json (scripts/pocket-onnx/export.py),
+// which is loaded before any session is created.
+let bundle = null;
+
 const DEBUG_LOGS = false;
 // Text chunking target; lower if long passages hit generation limits.
 const CHUNK_TARGET_TOKENS = 50;
@@ -34,17 +31,26 @@ const CHUNK_TARGET_TOKENS = 50;
 const RESET_FLOW_STATE_EACH_CHUNK = true;
 // If true, reset decoder state per chunk to avoid carry-over artifacts.
 const RESET_MIMI_STATE_EACH_CHUNK = true;
+// A fresh decoder state puts a small step in its first samples, heard as a
+// click at the start of every chunk. Upstream fades the first 5 ms in.
+const DECODER_FADE_IN_SECONDS = 0.005;
+// Flow-cache capacities are rounded up to this many frames so consecutive
+// utterances can reuse the resident voice state.
+const FLOW_CACHE_GRANULARITY = 64;
 
 // Model downloads go through the Cache API, so page loads after the first
-// read the roughly 125 MB of Pocket files from disk instead of the network.
+// read the Pocket files from disk instead of the network.
 // ONNX Runtime fetches URLs itself, so sessions are created from the cached
 // bytes rather than from the URL.
-const MODEL_CACHE_NAME = 'pocket-tts-models-v1';
+const MODEL_CACHE_NAME = 'pocket-tts-models-v2';
+// Caches of earlier model generations, deleted so their files stop using disk.
+const STALE_MODEL_CACHES = ['pocket-tts-models-v1'];
 let modelCachePromise = null;
 let loadProfile = null;
 
 function openModelCache() {
     if (typeof caches === 'undefined') return Promise.resolve(null);
+    for (const name of STALE_MODEL_CACHES) caches.delete(name).catch(() => {});
     modelCachePromise ??= caches.open(MODEL_CACHE_NAME).catch((err) => {
         console.warn('Model cache unavailable; downloading every load:', err);
         return null;
@@ -121,47 +127,36 @@ let ttsUsesWebGpu = false;
 let mimiEncoderProvider = null;
 let tokenizerProcessor = null;
 let tokenizerModelB64 = null;
-let bundleMetadata = null;
 let bosBeforeVoice = null;
 let predefinedVoices = {};
-let predefinedVoiceNames = ['alba', 'azelma', 'cosette', 'eponine', 'fantine', 'javert', 'jean', 'marius'];
+let predefinedVoiceNames = [];
 let predefinedVoiceLoadPromises = {};
-let stTensors = []; // Optimization: Pre-allocated s/t tensors for max LSD
+let stTensors = []; // Pre-allocated s/t tensors for LSD flow heads
 let isGenerating = false;
 let isReady = false;
 
-// Dynamic LSD (Latent Solver/Diffusion steps)
+// Dynamic LSD (Latent Solver/Diffusion steps); only used by bundles whose
+// flow head is 'lsd'. One-step heads ('drifting') ignore it.
 const MAX_LSD = 10;  // Max quality setting
 let currentLSD = 1;  // Default to 1 for faster generation (can be increased via set_lsd)
 
-// Current voice embedding (cached)
+// Current voice: a preset's PTVB record or a custom voice's encoder output.
 let currentVoiceEmbedding = null;
-// Conditioned flow-LM state for the active custom voice, kept on the CPU so
-// every chunk after the first rebuilds it with a copy instead of a prefill.
-// Used when the resident state below is disabled.
+// Conditioned flow-LM state for the active custom voice, kept compact on the
+// CPU so every chunk after the first rebuilds it with a copy instead of a
+// prefill. Used when the resident state below is disabled.
 let customVoiceFlowState = null;
 let currentVoiceName = null;
 
 // The voice-conditioned flow-LM state and the decoder's initial state, kept as
 // resident tensors that every utterance starts from. ONNX Runtime never writes
 // to its inputs and returns fresh state outputs, so the same tensors can seed
-// run after run. Without this each utterance expanded and uploaded about
-// 65 MiB of state before its first frame.
+// run after run. Without this each utterance expanded and uploaded its whole
+// voice state before its first frame.
 let useResidentState = true;
-let residentVoiceState = null; // { source, state, tensors }
+let residentVoiceState = null; // { source, capacity, state, tensors }
 let residentMimiState = null;  // { state, tensors }
 const NO_PROTECTED_TENSORS = new Set();
-
-const PREDEFINED_VOICE_RANGES = {
-    alba: { start: 9, end: 6193895 },
-    azelma: { start: 6193895, end: 14157255 },
-    cosette: { start: 14157255, end: 20351144 },
-    eponine: { start: 20351144, end: 27282313 },
-    fantine: { start: 27282313, end: 33820266 },
-    javert: { start: 33820266, end: 40014154 },
-    jean: { start: 40014154, end: 46208040 },
-    marius: { start: 46208040, end: 52401928 },
-};
 
 // Text preprocessing utilities
 const ONES = ['', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen'];
@@ -476,9 +471,8 @@ self.onmessage = async (e) => {
                 useResidentState = data.residentState;
             }
             if ([2, 4].includes(data?.streamChunkFrames)) streamChunkFrames = data.streamChunkFrames;
-            compactFlowEnabled = data?.flowCacheFrames !== 1000;
             await loadModels();
-            postMessage({ type: 'loaded', flowCacheFrames: STATE_CACHE_FRAMES });
+            postMessage({ type: 'loaded' });
         } catch (err) {
             postMessage({ type: 'error', error: err.toString() });
         }
@@ -566,6 +560,11 @@ async function loadModels() {
         throw new Error('ONNX Runtime failed to load');
     }
 
+    // The manifest describes every graph's state tensors, so it has to be
+    // read before any session is configured.
+    postMessage({ type: 'status', status: 'Loading model manifest...', state: 'loading' });
+    bundle = parseBundle(JSON.parse(new TextDecoder().decode(await fetchModelBytes(MODELS.bundle))));
+
     postMessage({ type: 'status', status: 'Loading models...', state: 'loading' });
 
     // Configure WASM Paths
@@ -616,36 +615,24 @@ async function loadModels() {
 
         // Recurrent caches are consumed by the next inference call and never
         // inspected by JavaScript. Keeping them on the GPU avoids downloading
-        // and uploading tens of megabytes of state for every generated frame.
+        // and uploading the state for every generated frame.
         const flowMainSessionOptions = hasWebGPU ? {
             ...sessionOptions,
             preferredOutputLocation: {
                 conditioning: 'gpu-buffer',
-                ...Object.fromEntries(
-                    Object.keys(FLOW_LM_STATE_SHAPES).map(name => [`out_${name}`, 'gpu-buffer'])
-                )
+                ...gpuStateOutputs(bundle.flowStates),
             }
         } : sessionOptions;
         const mimiDecoderSessionOptions = hasWebGPU ? {
             ...sessionOptions,
-            preferredOutputLocation: Object.fromEntries(
-                Object.keys(MIMI_DECODER_STATE_SHAPES).map(name => [`out_${name}`, 'gpu-buffer'])
-            )
+            preferredOutputLocation: gpuStateOutputs(bundle.decoderStates),
         } : sessionOptions;
 
         postMessage({ type: 'status', status: 'Loading text conditioner...', state: 'loading' });
         textConditionerSession = await createSessionFromUrl(MODELS.text_conditioner, sessionOptions);
 
         postMessage({ type: 'status', status: 'Loading language generator...', state: 'loading' });
-        flowSessionOptions = flowMainSessionOptions;
-        const flowBytes = await fetchModelBytes(MODELS.flow_lm_main);
-        let compacted = false;
-        if (compactFlowEnabled) {
-            try { compacted = await compactFlowModel(flowBytes); }
-            catch (err) { console.warn('Cache compaction unavailable; retaining original model:', err); }
-        }
-        setFlowCacheFrames(compacted ? 512 : 1000);
-        flowLmMainSession = await createProfiledSession(flowBytes, flowSessionOptions);
+        flowLmMainSession = await createSessionFromUrl(MODELS.flow_lm_main, flowMainSessionOptions);
 
         postMessage({ type: 'status', status: 'Loading flow decoder...', state: 'loading' });
         flowLmFlowSession = await createSessionFromUrl(MODELS.flow_lm_flow, sessionOptions);
@@ -682,10 +669,10 @@ async function loadModels() {
             console.log('Tokenizer loaded');
         }
 
-        // Load only the tiny manifest for preset voice names. The heavy voice
-        // state bundle is fetched lazily for the selected voice during speech.
-        postMessage({ type: 'status', status: 'Loading voice manifest...', state: 'loading' });
-        predefinedVoiceNames = await loadPredefinedVoiceNames();
+        // The heavy voice state bundle is fetched lazily for the selected
+        // voice during speech; the manifest already lists the names.
+        await loadBosBeforeVoice();
+        predefinedVoiceNames = Object.keys(bundle.voices);
 
         // Send list of available voices
         postMessage({
@@ -694,23 +681,21 @@ async function loadModels() {
             defaultVoice: currentVoiceName
         });
 
-        // Pre-allocate s/t tensors for Flow Matching Loop (Optimization)
-        // Pre-allocate for MAX_LSD to support dynamic switching
-        if (DEBUG_LOGS) {
-            console.log(`Pre-allocating Flow Matching tensors for LSD 1-${MAX_LSD}...`);
-        }
+        // Pre-allocate s/t tensors for LSD flow heads, for every step count
+        // set_lsd can select.
         stTensors = {};
-
-        for (let lsd = 1; lsd <= MAX_LSD; lsd++) {
-            stTensors[lsd] = [];
-            const dt = 1.0 / lsd;
-            for (let j = 0; j < lsd; j++) {
-                const s = j / lsd;
-                const t = s + dt;
-                stTensors[lsd].push({
-                    s: new ort.Tensor('float32', new Float32Array([s]), [1, 1]),
-                    t: new ort.Tensor('float32', new Float32Array([t]), [1, 1])
-                });
+        if (bundle.flow.type === 'lsd') {
+            for (let lsd = 1; lsd <= MAX_LSD; lsd++) {
+                stTensors[lsd] = [];
+                const dt = 1.0 / lsd;
+                for (let j = 0; j < lsd; j++) {
+                    const s = j / lsd;
+                    const t = s + dt;
+                    stTensors[lsd].push({
+                        s: new ort.Tensor('float32', new Float32Array([s]), [1, 1]),
+                        t: new ort.Tensor('float32', new Float32Array([t]), [1, 1])
+                    });
+                }
             }
         }
 
@@ -725,6 +710,40 @@ async function loadModels() {
         console.error('Model load failed:', err);
         throw err;
     }
+}
+
+/**
+ * Validates bundle.json and indexes what the worker needs from it.
+ */
+function parseBundle(manifest) {
+    const flowGraph = manifest?.graphs?.flow_lm_main;
+    const decoderGraph = manifest?.graphs?.mimi_decoder;
+    if (!Array.isArray(flowGraph?.states) || !Array.isArray(decoderGraph?.states) || !manifest.dims) {
+        throw new Error('bundle.json is missing graph state descriptions; re-export with scripts/pocket-onnx/export.py');
+    }
+    const flowType = manifest.flow?.type;
+    if (flowType !== 'drifting' && flowType !== 'lsd') {
+        throw new Error(`Unsupported flow head in bundle.json: ${flowType}`);
+    }
+    const voices = {};
+    for (const [name, range] of Object.entries(manifest.voices ?? {})) {
+        if (Number.isSafeInteger(range?.start) && Number.isSafeInteger(range?.end) && range.end > range.start) {
+            voices[name] = { start: range.start, end: range.end };
+        }
+    }
+    return {
+        ...manifest,
+        voices,
+        flowStates: flowGraph.states,
+        decoderStates: decoderGraph.states,
+        latentDim: manifest.dims.latent,
+        conditioningDim: manifest.dims.conditioning,
+        textEmbeddingDim: manifest.dims.text_embedding,
+    };
+}
+
+function gpuStateOutputs(stateSpecs) {
+    return Object.fromEntries(stateSpecs.map(spec => [spec.output, 'gpu-buffer']));
 }
 
 async function ensureMimiEncoderSession(forceWasm = false) {
@@ -765,22 +784,9 @@ async function releaseMimiEncoderSession() {
     }
 }
 
-async function loadPredefinedVoiceNames() {
-    try {
-        bundleMetadata = JSON.parse(new TextDecoder().decode(await fetchModelBytes(MODELS.bundle)));
-        await loadBosBeforeVoice();
-        if (Array.isArray(bundleMetadata.predefined_voices) && bundleMetadata.predefined_voices.length > 0) {
-            return bundleMetadata.predefined_voices.filter((voice) => typeof voice === 'string');
-        }
-    } catch (err) {
-        console.warn('Could not load voice manifest, using bundled defaults:', err);
-    }
-    return Object.keys(PREDEFINED_VOICE_RANGES);
-}
-
 async function loadBosBeforeVoice() {
     bosBeforeVoice = null;
-    if (!bundleMetadata?.insert_bos_before_voice) return;
+    if (!bundle?.insert_bos_before_voice) return;
 
     try {
         bosBeforeVoice = parseNpyFloat32(await fetchModelBytes(MODELS.bos_before_voice));
@@ -801,7 +807,7 @@ async function loadPredefinedVoice(voiceName) {
         postMessage({ type: 'status', status: `Loading ${voiceName} voice...`, state: 'loading' });
 
         try {
-            const range = PREDEFINED_VOICE_RANGES[voiceName];
+            const range = bundle.voices[voiceName];
             if (range) {
                 try {
                     // One voice's slice of the bundle, cached under its own key.
@@ -839,53 +845,10 @@ function cacheSinglePredefinedVoice(voiceName, voice) {
 
 function parseVoicesBin(buffer) {
     const magic = new TextDecoder().decode(new Uint8Array(buffer, 0, Math.min(5, buffer.byteLength)));
-    if (magic === 'PTVB1') {
-        return parsePtvbVoices(buffer);
+    if (magic !== 'PTVB1') {
+        throw new Error('voices.bin is not a PTVB1 voice bundle');
     }
-
-    // Simple binary format:
-    // Header: 4 bytes (uint32) = number of voices
-    // For each voice:
-    //   - 32 bytes: voice name (null-terminated string)
-    //   - 4 bytes (uint32): number of frames
-    //   - 4 bytes (uint32): embedding dim (1024)
-    //   - frames * dim * 4 bytes: float32 embeddings
-
-    const voices = {};
-    const view = new DataView(buffer);
-    let offset = 0;
-
-    const numVoices = view.getUint32(offset, true);
-    offset += 4;
-
-    for (let i = 0; i < numVoices; i++) {
-        // Read voice name
-        const nameBytes = new Uint8Array(buffer, offset, 32);
-        const nameEnd = nameBytes.indexOf(0);
-        const name = new TextDecoder().decode(nameBytes.subarray(0, nameEnd > 0 ? nameEnd : 32)).trim();
-        offset += 32;
-
-        // Read dimensions
-        const numFrames = view.getUint32(offset, true);
-        offset += 4;
-        const embDim = view.getUint32(offset, true);
-        offset += 4;
-
-        // Read embeddings
-        const embSize = numFrames * embDim;
-        const embeddings = new Float32Array(buffer, offset, embSize);
-        offset += embSize * 4;
-
-        // Store as [1, numFrames, embDim] shaped array info
-        voices[name] = {
-            data: new Float32Array(embeddings),
-            shape: [1, numFrames, embDim]
-        };
-
-        console.log(`Loaded voice '${name}': ${numFrames} frames, ${embDim} dim`);
-    }
-
-    return voices;
+    return parsePtvbVoices(buffer);
 }
 
 function parsePtvbVoiceSlice(buffer) {
@@ -1032,6 +995,7 @@ function parsePtvbVoices(buffer) {
 }
 
 function copyTensorDataFromBundle(voiceBundle, record) {
+    if (record.data) return cloneTypedArray(record.data);
     const bytes = new Uint8Array(voiceBundle.buffer, record.dataOffset, record.byteLength);
     if (record.dtype === 'float32') {
         const data = new Float32Array(record.byteLength / 4);
@@ -1046,103 +1010,65 @@ function copyTensorDataFromBundle(voiceBundle, record) {
     throw new Error(`Unsupported PTVB tensor dtype: ${record.dtype}`);
 }
 
-function copyPaddedFlowCacheFromBundle(voiceBundle, record, targetShape) {
-    const source = copyTensorDataFromBundle(voiceBundle, record);
-    const target = new Float32Array(targetShape.reduce((a, b) => a * b, 1));
-
-    if (record.shape.length !== targetShape.length || record.shape.length !== 5) {
-        throw new Error(`Unsupported flow cache shape: ${JSON.stringify(record.shape)}`);
-    }
-
-    const sourceSeq = record.shape[2];
-    const targetSeq = targetShape[2];
-    if (sourceSeq > targetSeq) {
-        throw new Error(`Voice cache has ${sourceSeq} frames, but model only accepts ${targetSeq}`);
-    }
-
-    const outer = record.shape[0] * record.shape[1];
-    const sourceTail = record.shape[3] * record.shape[4];
-    const targetTail = targetShape[3] * targetShape[4];
-    if (sourceTail !== targetTail) {
-        throw new Error(`Voice cache tail shape mismatch: ${JSON.stringify(record.shape)} vs ${JSON.stringify(targetShape)}`);
-    }
-
-    for (let outerIdx = 0; outerIdx < outer; outerIdx++) {
-        const sourceOffset = outerIdx * sourceSeq * sourceTail;
-        const targetOffset = outerIdx * targetSeq * targetTail;
-        target.set(
-            source.subarray(sourceOffset, sourceOffset + sourceSeq * sourceTail),
-            targetOffset,
-        );
-    }
-
-    return target;
+function dynamicAxis(spec) {
+    const axes = Object.keys(spec.dynamic ?? {});
+    return axes.length === 1 ? Number(axes[0]) : -1;
 }
 
-function createFlowStateFromPrecomputedVoice(voiceBundle) {
-    const flowLmState = initState(flowLmMainSession, FLOW_LM_STATE_SHAPES);
-
-    for (let layer = 0; layer < FLOW_LM_CACHE_LAYERS; layer++) {
-        const prefix = `transformer.layers.${layer}.self_attn`;
-        const cacheRecord = voiceBundle.tensors[`${prefix}/cache`];
-        const offsetRecord = voiceBundle.tensors[`${prefix}/offset`];
-        if (!cacheRecord || !offsetRecord) {
-            throw new Error(`Voice bundle is missing flow state for layer ${layer}`);
-        }
-
-        const cacheStateName = `state_${layer * 3}`;
-        const cacheShape = FLOW_LM_STATE_SHAPES[cacheStateName].shape;
-        flowLmState[`state_${layer * 3}`] = new ort.Tensor(
-            'float32',
-            copyPaddedFlowCacheFromBundle(voiceBundle, cacheRecord, cacheShape),
-            cacheShape,
-        );
-        flowLmState[`state_${layer * 3 + 2}`] = new ort.Tensor(
-            'int64',
-            copyTensorDataFromBundle(voiceBundle, offsetRecord),
-            offsetRecord.shape,
-        );
+/**
+ * Copies a compact state tensor into a zeroed tensor whose dynamic axis has
+ * `capacity` entries. Unwritten cache slots must be zeros, not NaN: the
+ * graph attends over the whole cache and masks the empty tail.
+ */
+function padAlongAxis(source, sourceShape, axis, capacity) {
+    const targetShape = sourceShape.slice();
+    targetShape[axis] = capacity;
+    if (sourceShape[axis] > capacity) {
+        throw new Error(`Voice state has ${sourceShape[axis]} frames, but the cache only holds ${capacity}`);
     }
+    const outer = sourceShape.slice(0, axis).reduce((a, b) => a * b, 1);
+    const inner = sourceShape.slice(axis + 1).reduce((a, b) => a * b, 1);
+    const sourceRow = sourceShape[axis] * inner;
+    const targetRow = capacity * inner;
+    const target = new Float32Array(outer * targetRow);
+    for (let i = 0; i < outer; i++) {
+        target.set(source.subarray(i * sourceRow, (i + 1) * sourceRow), i * targetRow);
+    }
+    return { data: target, shape: targetShape };
+}
 
+/**
+ * Builds the flow-LM input state from a voice-conditioned state (a preset's
+ * PTVB record or a custom voice's snapshot), with caches sized to `capacity`.
+ */
+function createFlowStateFromVoiceState(voiceState, capacity) {
+    const flowLmState = {};
+    for (const spec of bundle.flowStates) {
+        const record = voiceState.tensors[spec.name];
+        if (!record) {
+            throw new Error(`Voice state is missing ${spec.name}; re-export voices.bin for this model`);
+        }
+        const data = copyTensorDataFromBundle(voiceState, record);
+        const axis = dynamicAxis(spec);
+        if (axis < 0) {
+            flowLmState[spec.name] = new ort.Tensor(spec.dtype, data, record.shape);
+            continue;
+        }
+        const padded = padAlongAxis(data, record.shape, axis, capacity);
+        flowLmState[spec.name] = new ort.Tensor(spec.dtype, padded.data, padded.shape);
+    }
     return flowLmState;
+}
+
+/** Frames the voice prompt occupies in the flow cache. */
+function voiceStateFrames(voiceState) {
+    const offset = voiceState.tensors.state_offset;
+    if (!offset) throw new Error('Voice state is missing state_offset');
+    return Number(copyTensorDataFromBundle(voiceState, offset)[0]);
 }
 
 function cloneTypedArray(data) {
     return new data.constructor(data);
-}
-
-function compactFlowCache(data, dims, keepFrames) {
-    const outer = dims[0] * dims[1];
-    const seq = dims[2];
-    const tail = dims[3] * dims[4];
-    const compact = new Float32Array(outer * keepFrames * tail);
-
-    for (let outerIdx = 0; outerIdx < outer; outerIdx++) {
-        const sourceOffset = outerIdx * seq * tail;
-        compact.set(
-            data.subarray(sourceOffset, sourceOffset + keepFrames * tail),
-            outerIdx * keepFrames * tail,
-        );
-    }
-
-    return compact;
-}
-
-function expandFlowCache(compact, dims, keepFrames) {
-    const outer = dims[0] * dims[1];
-    const seq = dims[2];
-    const tail = dims[3] * dims[4];
-    const data = new Float32Array(outer * seq * tail);
-
-    for (let outerIdx = 0; outerIdx < outer; outerIdx++) {
-        const sourceOffset = outerIdx * keepFrames * tail;
-        data.set(
-            compact.subarray(sourceOffset, sourceOffset + keepFrames * tail),
-            outerIdx * seq * tail,
-        );
-    }
-
-    return data;
 }
 
 async function readTensorData(tensor) {
@@ -1155,60 +1081,28 @@ async function readTensorData(tensor) {
 }
 
 /**
- * Copies a voice-conditioned flow-LM state to the CPU. Only the frames the
- * cache actually holds are kept, which is the same compact layout preset
- * voices ship inside voices.bin.
+ * Copies a voice-conditioned flow-LM state to the CPU in the same layout
+ * preset voices ship inside voices.bin. The state was built with a cache
+ * exactly as long as the prompt, so nothing needs trimming.
  */
 async function snapshotFlowLmState(state) {
-    const cacheFrames = {};
-    for (let layer = 0; layer < FLOW_LM_CACHE_LAYERS; layer++) {
-        const offsetTensor = state[`state_${layer * 3 + 2}`];
-        if (!offsetTensor) continue;
-        const offsetData = await readTensorData(offsetTensor);
-        cacheFrames[`state_${layer * 3}`] = Number(offsetData[0]);
-    }
-
-    const snapshot = {};
-    for (const [name, tensor] of Object.entries(state)) {
-        const data = await readTensorData(tensor);
-        const dims = [...tensor.dims];
-        const frames = cacheFrames[name];
-
-        if (frames === undefined || dims.length !== 5) {
-            snapshot[name] = { type: tensor.type, dims, data: cloneTypedArray(data) };
-            continue;
-        }
-
-        const keepFrames = Math.max(0, Math.min(frames, dims[2]));
-        snapshot[name] = {
-            type: tensor.type,
-            dims,
-            keepFrames,
-            data: compactFlowCache(data, dims, keepFrames),
+    const tensors = {};
+    for (const spec of bundle.flowStates) {
+        const tensor = state[spec.name];
+        tensors[spec.name] = {
+            dtype: tensor.type,
+            shape: [...tensor.dims],
+            data: cloneTypedArray(await readTensorData(tensor)),
         };
     }
-
-    return snapshot;
-}
-
-function createFlowStateFromSnapshot(snapshot) {
-    const state = {};
-
-    for (const [name, record] of Object.entries(snapshot)) {
-        const data = record.keepFrames === undefined
-            ? cloneTypedArray(record.data)
-            : expandFlowCache(record.data, record.dims, record.keepFrames);
-        state[name] = new ort.Tensor(record.type, data, record.dims);
-    }
-
-    return state;
+    return { type: 'flow_state_snapshot', tensors };
 }
 
 function createVoiceConditioningTensor(voiceEmb) {
     let data = voiceEmb.data;
     let shape = voiceEmb.shape.slice();
 
-    if (bundleMetadata?.insert_bos_before_voice && bosBeforeVoice) {
+    if (bundle?.insert_bos_before_voice && bosBeforeVoice) {
         if (shape.length !== 3 || bosBeforeVoice.shape.length !== 3) {
             throw new Error(`Invalid voice conditioning shape: ${JSON.stringify(shape)}`);
         }
@@ -1232,10 +1126,52 @@ function describeRuntimeError(error) {
     return String(error);
 }
 
+/**
+ * Port of upstream's end_on_pause: end the prompt on exactly `pauseSec` of
+ * silence. A prompt that stops on speech makes the model continue that
+ * utterance; one that ends on a long silence delays the onset. Trailing
+ * 20 ms frames more than `floorDb` below the loudest are cut, the last
+ * `fadeSec` is faded out and `pauseSec` of zeros appended.
+ */
+function endOnPause(audio, sampleRate, pauseSec = 0.08, fadeSec = 0.02, floorDb = 35.0) {
+    const frame = Math.max(1, Math.floor(0.02 * sampleRate));
+    const frames = Math.floor(audio.length / frame);
+    if (frames === 0) return audio;
+    const db = new Float64Array(frames);
+    let loudest = -Infinity;
+    for (let i = 0; i < frames; i++) {
+        let sum = 0;
+        for (let j = i * frame; j < (i + 1) * frame; j++) sum += audio[j] * audio[j];
+        db[i] = 20 * Math.log10(Math.sqrt(sum / frame) + 1e-12);
+        loudest = Math.max(loudest, db[i]);
+    }
+    let last = frames - 1;
+    while (last > 0 && !(db[last] > loudest - floorDb)) last--;
+    const end = (last + 1) * frame;
+    const pause = Math.floor(pauseSec * sampleRate);
+    const out = new Float32Array(end + pause);
+    out.set(audio.subarray(0, end));
+    const fade = Math.min(Math.floor(fadeSec * sampleRate), end);
+    for (let i = 0; i < fade; i++) {
+        // torch.linspace(1, 0, fade)
+        out[end - fade + i] *= fade === 1 ? 1 : 1 - i / (fade - 1);
+    }
+    return out;
+}
+
+/** The encoder's convolutions need whole frames; pad the tail with zeros. */
+function padToFrames(audio, frameSize) {
+    const length = Math.ceil(audio.length / frameSize) * frameSize;
+    if (length === audio.length) return audio;
+    const padded = new Float32Array(length);
+    padded.set(audio);
+    return padded;
+}
+
 async function runVoiceEncoder(encoderSession, audioData) {
-    // audioData should be Float32Array at 24kHz, mono
-    // Reshape to [1, 1, samples]
-    const input = new ort.Tensor('float32', audioData, [1, 1, audioData.length]);
+    // audioData is mono Float32Array at the model's sample rate.
+    const prompt = padToFrames(endOnPause(audioData, bundle.sample_rate), bundle.frame_size);
+    const input = new ort.Tensor('float32', prompt, [1, 1, prompt.length]);
     let outputs = null;
 
     try {
@@ -1254,7 +1190,7 @@ async function runVoiceEncoder(encoderSession, audioData) {
 }
 
 async function encodeVoiceAudio(audioData) {
-    const durationSeconds = audioData.length / SAMPLE_RATE;
+    const durationSeconds = audioData.length / bundle.sample_rate;
     let webGpuError = null;
 
     try {
@@ -1294,124 +1230,28 @@ async function encodeVoiceAudio(audioData) {
     }
 }
 
-// Hardcoded state shapes extracted from ONNX model metadata
-// These are the initial shapes - dynamic dimensions start at 0
-const FLOW_LM_CACHE_LAYERS = 6;
-
-const FLOW_LM_STATE_SHAPES = {
-    // KV cache layers: [kv=2, batch=1, max_seq, heads=16, head_dim=64]
-    state_0: { shape: [2, 1, STATE_CACHE_FRAMES, 16, 64], dtype: 'float32' },
-    state_1: { shape: [0], dtype: 'float32' },  // dynamic
-    state_2: { shape: [1], dtype: 'int64' },    // step counter
-    state_3: { shape: [2, 1, STATE_CACHE_FRAMES, 16, 64], dtype: 'float32' },
-    state_4: { shape: [0], dtype: 'float32' },
-    state_5: { shape: [1], dtype: 'int64' },
-    state_6: { shape: [2, 1, STATE_CACHE_FRAMES, 16, 64], dtype: 'float32' },
-    state_7: { shape: [0], dtype: 'float32' },
-    state_8: { shape: [1], dtype: 'int64' },
-    state_9: { shape: [2, 1, STATE_CACHE_FRAMES, 16, 64], dtype: 'float32' },
-    state_10: { shape: [0], dtype: 'float32' },
-    state_11: { shape: [1], dtype: 'int64' },
-    state_12: { shape: [2, 1, STATE_CACHE_FRAMES, 16, 64], dtype: 'float32' },
-    state_13: { shape: [0], dtype: 'float32' },
-    state_14: { shape: [1], dtype: 'int64' },
-    state_15: { shape: [2, 1, STATE_CACHE_FRAMES, 16, 64], dtype: 'float32' },
-    state_16: { shape: [0], dtype: 'float32' },
-    state_17: { shape: [1], dtype: 'int64' },
-};
-
-const MIMI_DECODER_STATE_SHAPES = {
-    state_0: { shape: [1], dtype: 'bool' },
-    state_1: { shape: [1, 512, 6], dtype: 'float32' },
-    state_2: { shape: [1], dtype: 'bool' },
-    state_3: { shape: [1, 64, 2], dtype: 'float32' },
-    state_4: { shape: [1, 256, 6], dtype: 'float32' },
-    state_5: { shape: [1], dtype: 'bool' },
-    state_6: { shape: [1, 256, 2], dtype: 'float32' },
-    state_7: { shape: [1], dtype: 'bool' },
-    state_8: { shape: [1, 128, 0], dtype: 'float32' },  // dynamic
-    state_9: { shape: [1, 128, 5], dtype: 'float32' },
-    state_10: { shape: [1], dtype: 'bool' },
-    state_11: { shape: [1, 128, 2], dtype: 'float32' },
-    state_12: { shape: [1], dtype: 'bool' },
-    state_13: { shape: [1, 64, 0], dtype: 'float32' },  // dynamic
-    state_14: { shape: [1, 64, 4], dtype: 'float32' },
-    state_15: { shape: [1], dtype: 'bool' },
-    state_16: { shape: [1, 64, 2], dtype: 'float32' },
-    state_17: { shape: [1], dtype: 'bool' },
-    state_18: { shape: [1, 32, 0], dtype: 'float32' },  // dynamic
-    state_19: { shape: [2, 1, 8, STATE_CACHE_FRAMES, 64], dtype: 'float32' },
-    state_20: { shape: [1], dtype: 'int64' },
-    state_21: { shape: [1], dtype: 'int64' },
-    state_22: { shape: [2, 1, 8, STATE_CACHE_FRAMES, 64], dtype: 'float32' },
-    state_23: { shape: [1], dtype: 'int64' },
-    state_24: { shape: [1], dtype: 'int64' },
-    state_25: { shape: [1], dtype: 'bool' },
-    state_26: { shape: [1, 512, 16], dtype: 'float32' },
-    state_27: { shape: [1], dtype: 'bool' },
-    state_28: { shape: [1, 1, 6], dtype: 'float32' },
-    state_29: { shape: [1], dtype: 'bool' },
-    state_30: { shape: [1, 64, 2], dtype: 'float32' },
-    state_31: { shape: [1], dtype: 'bool' },
-    state_32: { shape: [1, 32, 0], dtype: 'float32' },  // dynamic
-    state_33: { shape: [1], dtype: 'bool' },
-    state_34: { shape: [1, 512, 2], dtype: 'float32' },
-    state_35: { shape: [1], dtype: 'bool' },
-    state_36: { shape: [1, 64, 4], dtype: 'float32' },
-    state_37: { shape: [1], dtype: 'bool' },
-    state_38: { shape: [1, 128, 2], dtype: 'float32' },
-    state_39: { shape: [1], dtype: 'bool' },
-    state_40: { shape: [1, 64, 0], dtype: 'float32' },  // dynamic
-    state_41: { shape: [1], dtype: 'bool' },
-    state_42: { shape: [1, 128, 5], dtype: 'float32' },
-    state_43: { shape: [1], dtype: 'bool' },
-    state_44: { shape: [1, 256, 2], dtype: 'float32' },
-    state_45: { shape: [1], dtype: 'bool' },
-    state_46: { shape: [1, 128, 0], dtype: 'float32' },  // dynamic
-    state_47: { shape: [1], dtype: 'bool' },
-    state_48: { shape: [1, 256, 6], dtype: 'float32' },
-    state_49: { shape: [2, 1, 8, STATE_CACHE_FRAMES, 64], dtype: 'float32' },
-    state_50: { shape: [1], dtype: 'int64' },
-    state_51: { shape: [1], dtype: 'int64' },
-    state_52: { shape: [2, 1, 8, STATE_CACHE_FRAMES, 64], dtype: 'float32' },
-    state_53: { shape: [1], dtype: 'int64' },
-    state_54: { shape: [1], dtype: 'int64' },
-    state_55: { shape: [1, 512, 16], dtype: 'float32' },
-};
-
-function initState(session, stateShapes) {
-    /**
-     * Initialize state tensors for a stateful ONNX model using hardcoded shapes.
-     */
+/**
+ * Zero-initialised state tensors for a graph, from its bundle.json state
+ * specs. Dynamic dimensions get `dynamicSize` entries.
+ */
+function initState(stateSpecs, dynamicSize = 0) {
     const state = {};
-
-    for (const inputName of session.inputNames) {
-        if (inputName.startsWith('state_')) {
-            const stateInfo = stateShapes[inputName];
-            if (!stateInfo) {
-                console.warn(`Unknown state input: ${inputName}, skipping`);
-                continue;
-            }
-
-            const { shape, dtype } = stateInfo;
-            const size = shape.reduce((a, b) => a * b, 1);
-
-            let data;
-            if (dtype === 'int64') {
-                data = new BigInt64Array(size);
-            } else if (dtype === 'bool') {
-                data = new Uint8Array(size);
-            } else {
-                data = new Float32Array(size);
-            }
-
-            state[inputName] = new ort.Tensor(dtype, data, shape);
-            if (DEBUG_LOGS) {
-                console.log(`Init state ${inputName}: shape=${JSON.stringify(shape)}, dtype=${dtype}`);
-            }
+    for (const spec of stateSpecs) {
+        const shape = spec.shape.map(dim => (dim === -1 ? dynamicSize : dim));
+        const size = shape.reduce((a, b) => a * b, 1);
+        let data;
+        if (spec.dtype === 'int64') {
+            data = new BigInt64Array(size);
+        } else if (spec.dtype === 'bool') {
+            data = new Uint8Array(size);
+        } else {
+            data = new Float32Array(size);
+        }
+        state[spec.name] = new ort.Tensor(spec.dtype, data, shape);
+        if (DEBUG_LOGS) {
+            console.log(`Init state ${spec.name}: shape=${JSON.stringify(shape)}, dtype=${spec.dtype}`);
         }
     }
-
     return state;
 }
 
@@ -1577,117 +1417,155 @@ async function startGeneration(text, voiceName, requestId) {
     }
 }
 
-function setFlowCacheFrames(frames) {
-    STATE_CACHE_FRAMES = frames;
-    for (const state of Object.values(FLOW_LM_STATE_SHAPES)) {
-        if (state.shape.length === 5) state.shape[2] = frames;
-    }
+/** Upstream's generation budget: tokens / 3 per second plus 2 s, in frames. */
+function maxGenerationFrames(tokenCount) {
+    const { tokens_per_second: tokensPerSecond, padding_seconds: paddingSeconds } = bundle.max_gen;
+    return Math.ceil((tokenCount / tokensPerSecond + paddingSeconds) * bundle.frame_rate);
 }
 
-async function ensureFlowCacheCapacity(voiceEmb, chunks) {
-    let voiceFrames;
-    if (voiceEmb.type === 'flow_state_bundle') {
-        voiceFrames = 0;
-        for (let layer = 0; layer < FLOW_LM_CACHE_LAYERS; layer++) {
-            const record = voiceEmb.tensors[`transformer.layers.${layer}.self_attn/offset`];
-            const cache = voiceEmb.tensors[`transformer.layers.${layer}.self_attn/cache`];
-            voiceFrames = Math.max(voiceFrames, Number(copyTensorDataFromBundle(voiceEmb, record)[0]), cache.shape[2]);
-        }
-    } else {
-        voiceFrames = voiceEmb.shape[1] + (bundleMetadata?.insert_bos_before_voice && bosBeforeVoice ? bosBeforeVoice.shape[1] : 0);
+/** Frames kept after the first EOS: very short prompts get a longer tail. */
+function framesAfterEos(text) {
+    const rule = bundle.eos.frames_after_eos;
+    const words = text.split(/\s+/).filter(Boolean).length;
+    return words <= rule.max_short_words ? rule.short : rule.long;
+}
+
+/**
+ * Flow-cache length for an utterance: the voice prompt, the longest chunk's
+ * text and its whole generation budget, rounded up so later utterances can
+ * reuse the resident voice state. The cache length is a dynamic dimension
+ * of the exported graph, so no capacity is baked into the model.
+ */
+function flowCacheCapacity(voiceFrames, chunkTokenCounts) {
+    const textAndFrames = Math.max(...chunkTokenCounts.map(tokens => tokens + maxGenerationFrames(tokens)));
+    const needed = voiceFrames + textAndFrames;
+    if (!Number.isSafeInteger(needed) || needed <= 0) throw new Error('Invalid flow cache length');
+    return Math.ceil(needed / FLOW_CACHE_GRANULARITY) * FLOW_CACHE_GRANULARITY;
+}
+
+function gaussianNoise(size, std) {
+    const data = new Float32Array(size);
+    for (let i = 0; i < size; i++) {
+        let u = 0, v = 0;
+        while (u === 0) u = Math.random();
+        while (v === 0) v = Math.random();
+        data[i] = Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v) * std;
     }
-    const textFrames = Math.max(...chunks.map(text => tokenizerProcessor.encodeIds(text).length));
-    const required = requiredFlowCapacity(voiceFrames, textFrames, MAX_FRAMES);
-    if (required <= STATE_CACHE_FRAMES && flowLmMainSession) return;
-    // Rare oversized input: release the compact session before restoring the
-    // original. Preserve all voice/text context and the generation limit.
-    releaseResidentVoiceState();
-    customVoiceFlowState = null;
-    await flowLmMainSession?.release();
-    flowLmMainSession = null;
-    flowLmMainSession = await createSessionFromUrl(MODELS.flow_lm_main, flowSessionOptions);
-    setFlowCacheFrames(1000);
+    return data;
+}
+
+/**
+ * Samples the next latent from the flow head. 'drifting' heads map scaled
+ * noise to the sample in one call; 'lsd' heads are integrated over
+ * `currentLSD` Euler steps.
+ */
+async function sampleLatent(conditioning) {
+    const dim = bundle.latentDim;
+    const xData = gaussianNoise(dim, Math.sqrt(bundle.temperature));
+
+    if (bundle.flow.type === 'drifting') {
+        const x = new ort.Tensor('float32', xData, [1, dim]);
+        const result = await flowLmFlowSession.run({ c: conditioning, x });
+        disposeTensor(x);
+        const latent = new Float32Array(await readTensorData(result.latent));
+        disposeResultExcept(result, new Set());
+        return latent;
+    }
+
+    const lsdSteps = currentLSD;
+    const dt = 1.0 / lsdSteps;
+    for (let j = 0; j < lsdSteps; j++) {
+        const x = new ort.Tensor('float32', xData, [1, dim]);
+        const result = await flowLmFlowSession.run({
+            c: conditioning,
+            s: stTensors[lsdSteps][j].s,
+            t: stTensors[lsdSteps][j].t,
+            x,
+        });
+        const v = await readTensorData(result.flow_dir);
+        for (let k = 0; k < dim; k++) xData[k] += v[k] * dt;
+        disposeTensor(x);
+        disposeResultExcept(result, new Set());
+    }
+    return xData;
+}
+
+function flowStateOutputNames() {
+    return new Set(bundle.flowStates.map(spec => spec.output));
 }
 
 async function runGenerationPipeline(voiceEmb, chunks) {
-    await ensureFlowCacheCapacity(voiceEmb, chunks);
+    const latentDim = bundle.latentDim;
+    const chunkTokenIds = chunks.map(text => tokenizerProcessor.encodeIds(text));
+
     // The decoder always starts from the same zeroed state; keep one resident
     // copy and seed every utterance from it.
     function freshMimiState() {
         if (!useResidentState) {
-            return { state: initState(mimiDecoderSession, MIMI_DECODER_STATE_SHAPES), protectedTensors: NO_PROTECTED_TENSORS };
+            return { state: initState(bundle.decoderStates), protectedTensors: NO_PROTECTED_TENSORS };
         }
         if (!residentMimiState) {
-            residentMimiState = makeResident(
-                uploadStateToGpu(initState(mimiDecoderSession, MIMI_DECODER_STATE_SHAPES))
-            );
+            residentMimiState = makeResident(uploadStateToGpu(initState(bundle.decoderStates)));
         }
         return { state: { ...residentMimiState.state }, protectedTensors: residentMimiState.tensors };
     }
 
     // Initialize state - may be reset per chunk
     let { state: mimiState, protectedTensors: protectedMimiTensors } = freshMimiState();
-    const emptySeq = new ort.Tensor('float32', new Float32Array(0), [1, 0, 32]);
-    const emptyTextEmb = new ort.Tensor('float32', new Float32Array(0), [1, 0, 1024]);
+    let decoderStateIsFresh = true;
+    const emptySeq = new ort.Tensor('float32', new Float32Array(0), [1, 0, latentDim]);
+    const emptyTextEmb = new ort.Tensor('float32', new Float32Array(0), [1, 0, bundle.textEmbeddingDim]);
+    const keptFlowOutputs = flowStateOutputNames();
 
-    async function buildVoiceConditionedState() {
-        if (useResidentState) {
-            if (!residentVoiceState || residentVoiceState.source !== voiceEmb) {
-                releaseResidentVoiceState();
-                const built = await conditionVoiceState();
-                residentVoiceState = { source: voiceEmb, ...makeResident(uploadStateToGpu(built)) };
-            }
-            return { state: { ...residentVoiceState.state }, protectedTensors: residentVoiceState.tensors };
-        }
-        return { state: await conditionVoiceState(), protectedTensors: NO_PROTECTED_TENSORS };
-    }
-
-    async function conditionVoiceState() {
-        if (voiceEmb.type === 'flow_state_bundle') {
-            console.log('Using precomputed voice state');
-            postMessage({ type: 'status', status: 'Using precomputed voice...', state: 'running' });
-            return createFlowStateFromPrecomputedVoice(voiceEmb);
-        }
-
+    /** Voice-conditioned state for a custom voice, compact on the CPU. */
+    async function customVoiceSnapshot() {
         if (customVoiceFlowState && customVoiceFlowState.source === voiceEmb) {
-            console.log('Using cached custom voice state');
-            return createFlowStateFromSnapshot(customVoiceFlowState.snapshot);
+            return customVoiceFlowState.snapshot;
         }
-
-        let flowLmState = initState(flowLmMainSession, FLOW_LM_STATE_SHAPES);
         const voiceTensor = createVoiceConditioningTensor(voiceEmb);
+        const promptFrames = voiceTensor.dims[1];
+        const flowLmState = initState(bundle.flowStates, promptFrames);
         console.log('Voice embeddings shape:', voiceEmb.shape);
         console.log('Running voice conditioning...');
         postMessage({ type: 'status', status: 'Conditioning voice...', state: 'running' });
-        const voiceCondInputs = {
+        const condResult = await flowLmMainSession.run({
             sequence: emptySeq,
             text_embeddings: voiceTensor,
             ...flowLmState
-        };
-
-        const condResult = await flowLmMainSession.run(voiceCondInputs);
+        });
         disposeTensor(voiceTensor);
-
-        // Update state from voice conditioning
         replaceNamedStateOutputs(flowLmState, condResult, flowLmMainSession.outputNames);
-        disposeResultExcept(
-            condResult,
-            new Set(flowLmMainSession.outputNames.filter(name => name.startsWith('out_state_')))
-        );
+        disposeResultExcept(condResult, keptFlowOutputs);
 
-        // Every later chunk rebuilds this state from the snapshot instead of
+        // Every later chunk rebuilds the state from this snapshot instead of
         // running the prefill again.
-        customVoiceFlowState = {
-            source: voiceEmb,
-            snapshot: await snapshotFlowLmState(flowLmState),
-        };
-        return flowLmState;
+        const snapshot = await snapshotFlowLmState(flowLmState);
+        disposeState(flowLmState);
+        customVoiceFlowState = { source: voiceEmb, snapshot };
+        return snapshot;
+    }
+
+    let voiceState = null;
+    let capacity = 0;
+
+    async function buildVoiceConditionedState() {
+        if (useResidentState) {
+            if (!residentVoiceState || residentVoiceState.source !== voiceEmb || residentVoiceState.capacity !== capacity) {
+                releaseResidentVoiceState();
+                const built = createFlowStateFromVoiceState(voiceState, capacity);
+                residentVoiceState = { source: voiceEmb, capacity, ...makeResident(uploadStateToGpu(built)) };
+            }
+            return { state: { ...residentVoiceState.state }, protectedTensors: residentVoiceState.tensors };
+        }
+        return { state: createFlowStateFromVoiceState(voiceState, capacity), protectedTensors: NO_PROTECTED_TENSORS };
     }
 
     let flowLmState = null;
     let protectedFlowTensors = NO_PROTECTED_TENSORS;
 
     try {
+    voiceState = voiceEmb.type === 'flow_state_bundle' ? voiceEmb : await customVoiceSnapshot();
+    capacity = flowCacheCapacity(voiceStateFrames(voiceState), chunkTokenIds.map(ids => ids.length));
     ({ state: flowLmState, protectedTensors: protectedFlowTensors } = await buildVoiceConditionedState());
     markTiming('voiceStateMs');
 
@@ -1716,16 +1594,18 @@ async function runGenerationPipeline(voiceEmb, chunks) {
         if (RESET_MIMI_STATE_EACH_CHUNK && chunkIdx > 0) {
             disposeState(mimiState, protectedMimiTensors);
             ({ state: mimiState, protectedTensors: protectedMimiTensors } = freshMimiState());
+            decoderStateIsFresh = true;
         }
 
         const chunkText = chunks[chunkIdx];
+        const isLastTextChunk = chunkIdx === chunks.length - 1;
         console.log(`Processing chunk ${chunkIdx + 1}/${chunks.length}: "${chunkText}"`);
         postMessage({ type: 'status', status: `Preparing text chunk ${chunkIdx + 1}/${chunks.length}...`, state: 'running' });
 
         let isFirstAudioChunkOfTextChunk = true;
 
         // Tokenize this chunk
-        const tokenIds = tokenizerProcessor.encodeIds(chunkText);
+        const tokenIds = chunkTokenIds[chunkIdx];
         console.log(`Chunk ${chunkIdx + 1} tokens:`, tokenIds.length);
 
         // Text conditioning for this chunk
@@ -1738,14 +1618,12 @@ async function runGenerationPipeline(voiceEmb, chunks) {
             textEmb = new ort.Tensor('float32', textEmb.data, [1, textEmb.dims[0], textEmb.dims[1]]);
         }
 
-        const textCondInputs = {
+        postMessage({ type: 'status', status: `Conditioning text chunk ${chunkIdx + 1}/${chunks.length}...`, state: 'running' });
+        const condResult = await flowLmMainSession.run({
             sequence: emptySeq,
             text_embeddings: textEmb,
             ...flowLmState
-        };
-
-        postMessage({ type: 'status', status: `Conditioning text chunk ${chunkIdx + 1}/${chunks.length}...`, state: 'running' });
-        const condResult = await flowLmMainSession.run(textCondInputs);
+        });
         if (chunkIdx === 0) markTiming('flowConditionedMs');
         disposeResultExcept(textCondResult, new Set());
         disposeTensor(textInput);
@@ -1753,80 +1631,73 @@ async function runGenerationPipeline(voiceEmb, chunks) {
 
         // Update state from text conditioning
         replaceNamedStateOutputs(flowLmState, condResult, flowLmMainSession.outputNames, protectedFlowTensors);
-        disposeResultExcept(
-            condResult,
-            new Set(flowLmMainSession.outputNames.filter(name => name.startsWith('out_state_')))
-        );
+        disposeResultExcept(condResult, keptFlowOutputs);
 
         // AR generation for this chunk
         const chunkLatents = [];
-        let currentLatent = new ort.Tensor('float32', new Float32Array(32).fill(NaN), [1, 1, 32]);
+        let currentLatent = new ort.Tensor('float32', new Float32Array(latentDim).fill(NaN), [1, 1, latentDim]);
         let chunkDecodedFrames = 0;
-        const FRAMES_AFTER_EOS = 3;  // Match PyTorch behavior - generate extra frames after EOS
+        const maxFrames = maxGenerationFrames(tokenIds.length);
+        const extraFrames = framesAfterEos(chunkText);
         let eosStep = null;
-
-        let chunkEnded = false;
         let chunkGenTimeMs = 0;
         postMessage({ type: 'status', status: `Generating audio frames...`, state: 'running' });
 
-        async function decodePendingFrames(isLastChunk) {
-            const pending = chunkLatents.length - chunkDecodedFrames;
-            if (pending <= 0) return;
-
+        async function decodeFrames(count, isLastChunk) {
+            if (count <= 0) return;
             if (DEBUG_LOGS) {
                 postMessage({
                     type: 'status',
-                    status: `Decoding ${pending} audio frame${pending === 1 ? '' : 's'}...`,
+                    status: `Decoding ${count} audio frame${count === 1 ? '' : 's'}...`,
                     state: 'running'
                 });
             }
 
-            const decodeLatents = new Float32Array(pending * 32);
-            for (let i = 0; i < pending; i++) {
-                decodeLatents.set(chunkLatents[chunkDecodedFrames + i], i * 32);
+            const decodeLatents = new Float32Array(count * latentDim);
+            for (let i = 0; i < count; i++) {
+                decodeLatents.set(chunkLatents[chunkDecodedFrames + i], i * latentDim);
             }
 
-            const latentTensor = new ort.Tensor('float32', decodeLatents, [1, pending, 32]);
-            const decodeInputs = { latent: latentTensor, ...mimiState };
+            const latentTensor = new ort.Tensor('float32', decodeLatents, [1, count, latentDim]);
             const decStart = performance.now();
-            const decodeResult = await mimiDecoderSession.run(decodeInputs);
+            const decodeResult = await mimiDecoderSession.run({ latent: latentTensor, ...mimiState });
             disposeTensor(latentTensor);
             const decElapsed = performance.now() - decStart;
             totalDecodeTime += decElapsed;
             chunkGenTimeMs += decElapsed;
-            const audioChunk = decodeResult[mimiDecoderSession.outputNames[0]].data;
+            const audioFloat32 = new Float32Array(await readTensorData(decodeResult.audio));
 
-            const keptDecoderOutputs = new Set();
-            for (let i = 1; i < mimiDecoderSession.outputNames.length; i++) {
-                const outputName = mimiDecoderSession.outputNames[i];
-                const stateName = `state_${i - 1}`;
-                const nextTensor = decodeResult[outputName];
-                if (!nextTensor) continue;
-                keptDecoderOutputs.add(outputName);
-                const previousTensor = mimiState[stateName];
-                mimiState[stateName] = nextTensor;
-                if (previousTensor !== nextTensor && !protectedMimiTensors.has(previousTensor)) {
-                    disposeTensor(previousTensor);
+            replaceNamedStateOutputs(mimiState, decodeResult, mimiDecoderSession.outputNames, protectedMimiTensors);
+            disposeResultExcept(decodeResult, new Set(bundle.decoderStates.map(spec => spec.output)));
+
+            if (decoderStateIsFresh) {
+                const fade = Math.min(audioFloat32.length, Math.floor(bundle.sample_rate * DECODER_FADE_IN_SECONDS));
+                for (let i = 0; i < fade; i++) audioFloat32[i] *= fade === 1 ? 1 : i / (fade - 1);
+                decoderStateIsFresh = false;
+            }
+
+            chunkDecodedFrames += count;
+            totalDecodedFrames += count;
+
+            if (isFirstAudioChunk) {
+                markTiming('firstAudioMs');
+                if (generationTimings) {
+                    generationTimings.firstDecodeMs = Math.round(decElapsed);
+                    generationTimings.framesInFirstAudio = count;
                 }
             }
-            disposeResultExcept(decodeResult, keptDecoderOutputs);
-
-            chunkDecodedFrames += pending;
-            totalDecodedFrames += pending;
-
-            const audioFloat32 = new Float32Array(audioChunk);
             postMessage({
                 type: 'audio_chunk',
                 data: audioFloat32,
                 metrics: {
                     bbTime: 0,
                     decTime: 0,
-                    chunkDuration: audioFloat32.length / SAMPLE_RATE,
+                    chunkDuration: audioFloat32.length / bundle.sample_rate,
                     genTimeSec: chunkGenTimeMs / 1000,
                     isFirst: isFirstAudioChunk,
                     isLast: isLastChunk,
                     chunkStart: isFirstAudioChunkOfTextChunk,
-                    flushed: true
+                    timings: isFirstAudioChunk ? { ...generationTimings } : undefined
                 }
             }, [audioFloat32.buffer]);
 
@@ -1835,30 +1706,42 @@ async function runGenerationPipeline(voiceEmb, chunks) {
             chunkGenTimeMs = 0;
         }
 
-        for (let step = 0; step < MAX_FRAMES; step++) {
+        for (let step = 0; step < maxFrames; step++) {
             if (!isGenerating) break;
 
-            // Yield every 4 steps to allow message processing (e.g., set_lsd)
+            // Yield every 4 steps to allow message processing (e.g., stop)
             if (step > 0 && step % 4 === 0) {
                 await yieldToMessageQueue();
             }
 
-            const arInputs = {
+            const stepStart = performance.now();
+            const arResult = await flowLmMainSession.run({
                 sequence: currentLatent,
                 text_embeddings: emptyTextEmb,
                 ...flowLmState
-            };
-
-            const stepStart = performance.now();
-            const previousLatent = currentLatent;
-            const arResult = await flowLmMainSession.run(arInputs);
-            disposeTensor(previousLatent);
-            const stepElapsed = performance.now() - stepStart;
-            chunkGenTimeMs += stepElapsed;
+            });
             if (chunkIdx === 0 && step === 0) {
                 markTiming('firstFrameMs');
-                if (generationTimings) generationTimings.firstStepMs = Math.round(stepElapsed);
+                if (generationTimings) generationTimings.firstStepMs = Math.round(performance.now() - stepStart);
             }
+
+            // Upstream ignores EOS on the first frames (some voices cross the
+            // threshold before speech starts), then keeps `extraFrames`
+            // frames after it; the frame at eosStep + extraFrames is dropped.
+            const eosLogit = (await readTensorData(arResult.eos_logit))[0];
+            if (eosStep === null && step >= bundle.eos.min_frames && eosLogit > bundle.eos.threshold) {
+                eosStep = step;
+            }
+            if (eosStep !== null && step >= eosStep + extraFrames) {
+                disposeResultExcept(arResult, new Set());
+                console.log(`Chunk ${chunkIdx + 1} EOS at step ${eosStep}, stopped at step ${step}, ${chunkLatents.length} frames`);
+                break;
+            }
+
+            const latentData = await sampleLatent(arResult.conditioning);
+            const stepElapsed = performance.now() - stepStart;
+            chunkGenTimeMs += stepElapsed;
+            totalFlowLmTime += stepElapsed;
             if (DEBUG_LOGS && (step === 0 || (step + 1) % 5 === 0)) {
                 postMessage({
                     type: 'status',
@@ -1867,163 +1750,32 @@ async function runGenerationPipeline(voiceEmb, chunks) {
                 });
             }
 
-            const conditioning = arResult['conditioning'];
-            const eosLogit = arResult['eos_logit'].data[0];
-            const isEos = eosLogit > -4.0;
-
-            // Track when EOS is first detected
-            if (isEos && eosStep === null) {
-                eosStep = step;
-            }
-
-            // Only stop after FRAMES_AFTER_EOS additional frames
-            const shouldStop = eosStep !== null && step >= eosStep + FRAMES_AFTER_EOS;
-
-            // Flow matching (LSD loop) - uses currentLSD which can be adjusted dynamically
-            const TEMP = 0.7;
-            const STD = Math.sqrt(TEMP);
-            let xData = new Float32Array(32);
-            for (let i = 0; i < 32; i++) {
-                let u = 0, v = 0;
-                while (u === 0) u = Math.random();
-                while (v === 0) v = Math.random();
-                xData[i] = Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v) * STD;
-            }
-
-            const lsdSteps = currentLSD;
-            const dt = 1.0 / lsdSteps;
-
-            for (let j = 0; j < lsdSteps; j++) {
-                const xTensor = new ort.Tensor('float32', xData, [1, 32]);
-                const flowInputs = {
-                    c: conditioning,
-                    s: stTensors[lsdSteps][j].s,
-                    t: stTensors[lsdSteps][j].t,
-                    x: xTensor
-                };
-
-                const flowResult = await flowLmFlowSession.run(flowInputs);
-                const v = flowResult['flow_dir'].data;
-
-                for (let k = 0; k < 32; k++) {
-                    xData[k] += v[k] * dt;
-                }
-                disposeTensor(xTensor);
-                disposeResultExcept(flowResult, new Set());
-            }
-
-            totalFlowLmTime += stepElapsed;
-
-            const latentData = xData;
-            chunkLatents.push(new Float32Array(latentData));
+            chunkLatents.push(latentData);
             generatedLatentCount++;
 
             // Update state
-            currentLatent = new ort.Tensor('float32', latentData, [1, 1, 32]);
+            disposeTensor(currentLatent);
+            currentLatent = new ort.Tensor('float32', new Float32Array(latentData), [1, 1, latentDim]);
             replaceNamedStateOutputs(flowLmState, arResult, flowLmMainSession.outputNames, protectedFlowTensors);
-            disposeResultExcept(
-                arResult,
-                new Set(flowLmMainSession.outputNames.filter(name => name.startsWith('out_state_')))
-            );
+            disposeResultExcept(arResult, keptFlowOutputs);
 
-            // Decode audio chunks
-            const pending = chunkLatents.length - chunkDecodedFrames;
-            let decodeSize = 0;
-
-            if (shouldStop) {
-                decodeSize = pending;
-            } else if (pending >= STREAM_CHUNK_FRAMES) {
-                decodeSize = STREAM_CHUNK_FRAMES;
-            }
-
-            if (decodeSize > 0) {
-                if (DEBUG_LOGS) {
-                    postMessage({
-                        type: 'status',
-                        status: `Decoding ${decodeSize} audio frame${decodeSize === 1 ? '' : 's'}...`,
-                        state: 'running'
-                    });
-                }
-                const decodeLatents = new Float32Array(decodeSize * 32);
-                for (let i = 0; i < decodeSize; i++) {
-                    decodeLatents.set(chunkLatents[chunkDecodedFrames + i], i * 32);
-                }
-
-                const latentTensor = new ort.Tensor('float32', decodeLatents, [1, decodeSize, 32]);
-                const decodeInputs = { latent: latentTensor, ...mimiState };
-
-                const decStart = performance.now();
-                const decodeResult = await mimiDecoderSession.run(decodeInputs);
-                disposeTensor(latentTensor);
-                const decElapsed = performance.now() - decStart;
-                totalDecodeTime += decElapsed;
-                chunkGenTimeMs += decElapsed;
-                const audioChunk = decodeResult[mimiDecoderSession.outputNames[0]].data;
-
-                // Update MIMI state
-                const keptDecoderOutputs = new Set();
-                for (let i = 1; i < mimiDecoderSession.outputNames.length; i++) {
-                    const outputName = mimiDecoderSession.outputNames[i];
-                    const stateName = `state_${i - 1}`;
-                    const nextTensor = decodeResult[outputName];
-                    if (!nextTensor) continue;
-                    keptDecoderOutputs.add(outputName);
-                    const previousTensor = mimiState[stateName];
-                    mimiState[stateName] = nextTensor;
-                    if (previousTensor !== nextTensor && !protectedMimiTensors.has(previousTensor)) {
-                        disposeTensor(previousTensor);
-                    }
-                }
-                disposeResultExcept(decodeResult, keptDecoderOutputs);
-
-                chunkDecodedFrames += decodeSize;
-                totalDecodedFrames += decodeSize;
-
-                const audioFloat32 = new Float32Array(audioChunk);
-                const isLastChunk = shouldStop && chunkIdx === chunks.length - 1;
-                if (isFirstAudioChunk) {
-                    markTiming('firstAudioMs');
-                    if (generationTimings) {
-                        generationTimings.firstDecodeMs = Math.round(decElapsed);
-                        generationTimings.framesInFirstAudio = decodeSize;
-                    }
-                }
-                postMessage({
-                    type: 'audio_chunk',
-                    data: audioFloat32,
-                    metrics: {
-                        bbTime: 0,
-                        decTime: 0,
-                        chunkDuration: audioFloat32.length / SAMPLE_RATE,
-                        genTimeSec: chunkGenTimeMs / 1000,
-                        isFirst: isFirstAudioChunk,
-                        isLast: isLastChunk,
-                        chunkStart: isFirstAudioChunkOfTextChunk,
-                        timings: isFirstAudioChunk ? { ...generationTimings } : undefined
-                    }
-                }, [audioFloat32.buffer]);
-
-                isFirstAudioChunk = false;
-                isFirstAudioChunkOfTextChunk = false;
-                chunkGenTimeMs = 0;
-            }
-
-            if (shouldStop) {
-                console.log(`Chunk ${chunkIdx + 1} EOS at step ${eosStep}, stopped at step ${step}, ${chunkLatents.length} frames`);
-                chunkEnded = true;
-                break;
+            if (chunkLatents.length - chunkDecodedFrames >= STREAM_CHUNK_FRAMES) {
+                await decodeFrames(STREAM_CHUNK_FRAMES, false);
             }
         }
 
+        if (eosStep === null && isGenerating) {
+            console.warn(`Chunk ${chunkIdx + 1} reached ${maxFrames} frames without EOS`);
+        }
         if (isGenerating && chunkDecodedFrames < chunkLatents.length) {
-            await decodePendingFrames(chunkIdx === chunks.length - 1);
+            await decodeFrames(chunkLatents.length - chunkDecodedFrames, isLastTextChunk);
         }
 
         disposeTensor(currentLatent);
     }
 
     const totalTime = (performance.now() - arStartTime) / 1000;
-    const audioSeconds = generatedLatentCount * SAMPLES_PER_FRAME / SAMPLE_RATE;
+    const audioSeconds = generatedLatentCount * bundle.frame_size / bundle.sample_rate;
 
     // RTFx based on actual generation time (flow LM + decoder), not including conditioning
     const genTime = (totalFlowLmTime + totalDecodeTime) / 1000;
@@ -2048,6 +1800,7 @@ async function runGenerationPipeline(voiceEmb, chunks) {
             frames: generatedLatentCount,
             flowMsPerStep: totalFlowLmTime / Math.max(1, generatedLatentCount),
             decodeMs: totalDecodeTime,
+            flowCacheFrames: capacity,
             timings: { ...generationTimings },
         }
     });
@@ -2056,29 +1809,5 @@ async function runGenerationPipeline(voiceEmb, chunks) {
         disposeState(mimiState, protectedMimiTensors);
         disposeTensor(emptySeq);
         disposeTensor(emptyTextEmb);
-    }
-}
-
-// Pre-allocated buffers for step counter updates (avoid GC pressure in hot loop)
-const stepBuffers = {};
-
-function updateStateSteps(state, increment) {
-    // Update step counters in state dict - reuse buffers to avoid allocation
-    const incBigInt = BigInt(increment);
-    for (const key in state) {
-        if (key.includes('step') && state[key]) {
-            const tensor = state[key];
-            if (tensor.data instanceof BigInt64Array) {
-                // Reuse buffer if same size, otherwise create new one
-                if (!stepBuffers[key] || stepBuffers[key].length !== tensor.data.length) {
-                    stepBuffers[key] = new BigInt64Array(tensor.data.length);
-                }
-                const buf = stepBuffers[key];
-                for (let i = 0; i < tensor.data.length; i++) {
-                    buf[i] = tensor.data[i] + incBigInt;
-                }
-                state[key] = new ort.Tensor('int64', buf, tensor.dims);
-            }
-        }
     }
 }

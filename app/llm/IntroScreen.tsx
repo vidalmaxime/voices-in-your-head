@@ -2,13 +2,10 @@ import "./intro.css";
 import Image from "next/image";
 import { useState, type CSSProperties } from "react";
 import { assetUrl } from "../base-path";
+import { FIRST_LOAD_BYTES } from "./first-load";
 
-/**
- * First-visit download, in MB, for the default model stack: the notebooks
- * 350M completion model (294), Parakeet CTC 0.6B Q4 (644), the Pocket TTS
- * core sessions (126), and one preset voice (about 7). The browser caches it.
- */
-const FIRST_LOAD_MB = 1070;
+/** First-visit download, in MB. The browser caches it. */
+const FIRST_LOAD_MB = Math.round(FIRST_LOAD_BYTES / 1e6);
 
 // Face centres and soft mask radii, as percentages of the welcome artwork.
 // Visit every face in a scattered order rather than sweeping along the rows.

@@ -883,10 +883,8 @@ export default function LLMPage() {
 
         await ttsRef.current.initialize({
           seed: Math.floor(Math.random() * 2 ** 32),
-          temperature: 0.7,
           lsd: 1,
           residentState: initialResidentState(),
-          flowCacheFrames: debugParam("debugFlowCache") === "1000" ? 1000 : 512,
         });
         const voiceList = await ttsRef.current.loadVoices();
         setVoices(voiceList);
@@ -903,6 +901,8 @@ export default function LLMPage() {
         ttsLoadedRef.current = true;
         const voiceStartedAt = performance.now();
         await prepareTTSVoice(ttsRef.current, voiceToPrepare, customVoiceFileRef.current);
+        // The worker reports no byte progress; its files and the voice are in by now.
+        setTtsProgress(1);
         const warmupStartedAt = performance.now();
         setLoadingMessage("Warming up speech...");
         await warmTTSGraphs(ttsRef.current);

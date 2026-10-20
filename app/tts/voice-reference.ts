@@ -1,6 +1,7 @@
 export const MAX_VOICE_UPLOAD_SECONDS = 30;
-// Mimi's exported encoder has a 1,000-frame transformer cache. Staying below
-// its roughly 20-second boundary avoids opaque ORT failures on long prompts.
+// Mimi's encoder transformer attends over the whole prompt at 200 Hz, so its
+// memory grows with the square of the prompt length. 15 seconds keeps it
+// within browser limits; upstream's preset voices are about 10 seconds.
 export const MAX_VOICE_REFERENCE_SECONDS = 15;
 export const MIN_VOICE_REFERENCE_SECONDS = 1;
 

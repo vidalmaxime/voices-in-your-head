@@ -50,8 +50,6 @@ export type PocketTTSOnnxSettings = {
   lsd?: number;
   /** Keep the conditioned voice state resident on the GPU between utterances (default true). */
   residentState?: boolean;
-  /** Disable compact flow-state storage for a baseline comparison. */
-  flowCacheFrames?: 512 | 1000;
 };
 
 export class PocketTTSOnnx {
@@ -78,7 +76,6 @@ export class PocketTTSOnnx {
 
   private lsd = 1;
   private residentState = true;
-  private flowCacheFrames: 512 | 1000 = 512;
   private seed = 0;
   private temperature = 0.9;
   private speakerGain = 1;
@@ -278,7 +275,6 @@ export class PocketTTSOnnx {
         temperature: this.temperature,
         speakerGain: this.speakerGain,
         residentState: this.residentState,
-        flowCacheFrames: this.flowCacheFrames,
       },
     });
 
@@ -309,10 +305,6 @@ export class PocketTTSOnnx {
     }
     if (typeof settings.residentState === "boolean") {
       this.residentState = settings.residentState;
-    }
-    if (settings.flowCacheFrames && settings.flowCacheFrames !== this.flowCacheFrames) {
-      this.flowCacheFrames = settings.flowCacheFrames;
-      this.needsReload = true;
     }
 
     await this.initWorker();
